@@ -1,9 +1,14 @@
 r"""
-win_fix.py  v1.5.0
+win_fix.py  v1.6.0
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.6.0: 🧽 Чистка реестра (как в CCleaner): неиспользуемые расширения, неверный/пустой класс файлов, ошибки путей
+        приложений (Compatibility Assistant, Layers, App Paths), ошибки установки (Installer\Folders), пустые
+        программные ключи, правила брандмауэра на удалённые программы, устаревшие ссылки MUI, автозагрузка без
+        файла, устаревшие записи установки, общие DLL; галочки, категории (запоминаются), всё — в ↩ Откат.
+        Пути на неподключённых дисках (флешка, сеть) не считаются мусором: ⚠ и без галочки.
 v1.5.0: 🗑 Программы — список установленных (HKLM/HKCU, 32/64), запуск деинсталлятора (MSI: /X) с ожиданием,
         поиск остатков: папка установки, Program Files/ProgramData/AppData (+ папка издателя), ярлыки,
         ключи реестра (+ ключ издателя), запись «Программы и компоненты», автозагрузка, службы и задачи из
@@ -80,7 +85,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -2041,6 +2046,143 @@ def backup_size() -> int:
     return _dir_size(str(BACKUP_DIR / "uninstall"), 5) if (BACKUP_DIR / "uninstall").is_dir() else 0
 
 
+# ───────────────────────── чистка реестра (как CCleaner) ─────────────────────────
+RC_CATS = [("fileexts", "Неиспользуемые расширения файлов"), ("badclass", "Неверный или пустой класс файлов"),
+           ("apppaths", "Ошибки путей приложений"), ("installer", "Ошибки установки приложений"),
+           ("software", "Пустой программный ключ"), ("firewall", "Неверное правило брандмауэра"),
+           ("mui", "Устаревшие ссылки MUI"), ("run", "Автозагрузка: файла нет"),
+           ("uninst", "Устаревшая запись установки"), ("shareddll", "Отсутствующие общие DLL")]
+RC_TITLE = dict(RC_CATS)
+FILEEXTS = r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts"
+MUICACHE = r"Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache"
+COMPAT_STORE = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store"
+COMPAT_LAYERS = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+APP_PATHS = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+INSTALLER_FOLDERS = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\Folders"
+FW_RULES = r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules"
+SHARED_DLLS = r"SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs"
+
+
+def _path_state(p: str) -> str:
+    """ok — есть; missing — нет; nodrive — диск не подключён (флешка/сеть): не трогаем; skip — не путь."""
+    p = os.path.expandvars(str(p or "").strip().strip('"')).rstrip("\\") or ""
+    if not p or p.startswith(("@", "\\\\?\\", "\\Device", "%")) or "://" in p:
+        return "skip"
+    drive, _rest = os.path.splitdrive(p)
+    if drive.startswith("\\\\"):  # сетевой путь — сеть может быть недоступна
+        return "nodrive" if not os.path.exists(drive + "\\") else ("ok" if os.path.exists(p) else "missing")
+    if IS_WIN and not drive:
+        return "skip"
+    if drive and not os.path.exists(drive + "\\"):
+        return "nodrive"
+    return "ok" if os.path.exists(p) else "missing"
+
+
+def _rc_item(cat, data, root, path, op, name=None, state="missing"):
+    nodrive = state == "nodrive"
+    return dict(cat=cat, title=RC_TITLE[cat], data=str(data), key=rf"{root}\{path}" + (f"\\{name}" if name else ""),
+                root=root, path=path, name=name, op=op, st="warn" if nodrive else "bad",
+                note="диск не подключён (флешка/сеть) — не отмечено" if nodrive else "")
+
+
+def regclean_scan(cats=None) -> list:
+    cats = set(cats or dict(RC_CATS))
+    out = []
+
+    def add(*a, **kw):
+        out.append(_rc_item(*a, **kw))
+
+    if "fileexts" in cats:
+        for ext in reg_subkeys("HKCU", FILEEXTS):
+            uc = reg_get("HKCU", rf"{FILEEXTS}\{ext}\UserChoice", "ProgId")
+            if ext in (".", "") or (not reg_key_exists("HKCR", ext) and not (uc and reg_key_exists("HKCR", uc))):
+                add("fileexts", ext, "HKCU", rf"{FILEEXTS}\{ext}", "tree")
+    if "badclass" in cats:
+        for k in reg_subkeys("HKCR", ""):
+            if k.startswith("."):
+                prog = reg_get("HKCR", k, "")
+                if isinstance(prog, str) and prog.strip() and not reg_key_exists("HKCR", prog):
+                    add("badclass", f"{k} → {prog}", "HKCR", k, "defval")
+            elif "." in k and not k.startswith(("*", "{")) and not reg_values("HKCR", k) and not reg_subkeys("HKCR", k):
+                add("badclass", k, "HKCR", k, "tree")
+    if "apppaths" in cats:
+        for root in ("HKCU", "HKLM"):
+            store = COMPAT_STORE if root == "HKCU" else None
+            for base in filter(None, (store, COMPAT_LAYERS)):
+                for n, _v, _t in reg_values(root, base):
+                    s = _path_state(n)
+                    if s in ("missing", "nodrive"):
+                        add("apppaths", n, root, base, "val", name=n, state=s)
+            ap = APP_PATHS if root == "HKLM" else r"Software\Microsoft\Windows\CurrentVersion\App Paths"
+            for exe in reg_subkeys(root, ap):
+                v = reg_get(root, rf"{ap}\{exe}", "")
+                s = _path_state(v)
+                if s in ("missing", "nodrive"):
+                    add("apppaths", v, root, rf"{ap}\{exe}", "tree", state=s)
+    if "installer" in cats:
+        for n, _v, _t in reg_values("HKLM", INSTALLER_FOLDERS):
+            s = _path_state(n)
+            if s in ("missing", "nodrive"):
+                add("installer", n, "HKLM", INSTALLER_FOLDERS, "val", name=n, state=s)
+    if "software" in cats:
+        for k in reg_subkeys("HKCU", "Software"):
+            if _norm(k) not in PROTECT and not reg_values("HKCU", rf"Software\{k}") and \
+                    not reg_subkeys("HKCU", rf"Software\{k}"):
+                add("software", k, "HKCU", rf"Software\{k}", "tree")
+    if "firewall" in cats:
+        for n, v, _t in reg_values("HKLM", FW_RULES):
+            m = re.search(r"\|App=([^|]+)", str(v))
+            if m:
+                s = _path_state(m.group(1))
+                if s in ("missing", "nodrive"):
+                    rn = re.search(r"\|Name=([^|]+)", str(v))
+                    add("firewall", f"{n} — {m.group(1)}" + (f" ({rn.group(1)})" if rn else ""), "HKLM", FW_RULES,
+                        "val", name=n, state=s)
+    if "mui" in cats:
+        for n, _v, _t in reg_values("HKCU", MUICACHE):
+            if n.startswith("@") or "." not in n:
+                continue
+            path = n.rsplit(".", 1)[0]  # «C:\x\app.exe.FriendlyAppName» → «C:\x\app.exe»
+            s = _path_state(path)
+            if s in ("missing", "nodrive"):
+                add("mui", n, "HKCU", MUICACHE, "val", name=n, state=s)
+    if "run" in cats:
+        for root, path, _appr in RUN_KEYS:
+            for n, v, _t in reg_values(root, path):
+                exe = exe_from_cmd(str(v))
+                if n and os.path.isabs(os.path.expandvars(exe)):
+                    s = _path_state(exe)
+                    if s in ("missing", "nodrive"):
+                        add("run", f"{n}: {v}", root, path, "val", name=n, state=s)
+    if "uninst" in cats:
+        for root, base in UNINST_KEYS:
+            for sub in reg_subkeys(root, base):
+                k = rf"{base}\{sub}"
+                cmd = str(reg_get(root, k, "UninstallString") or "")
+                if not cmd or re.search(r"msiexec", cmd, re.I) or reg_get(root, k, "SystemComponent") == 1:
+                    continue
+                exe = exe_from_cmd(cmd)
+                loc = str(reg_get(root, k, "InstallLocation") or "").strip().strip('"')
+                s = _path_state(exe)
+                if s in ("missing", "nodrive") and (not loc or _path_state(loc) != "ok"):
+                    add("uninst", f"{reg_get(root, k, 'DisplayName') or sub}: {cmd}", root, k, "tree", state=s)
+    if "shareddll" in cats:
+        for n, _v, _t in reg_values("HKLM", SHARED_DLLS):
+            s = _path_state(n)
+            if s in ("missing", "nodrive"):
+                add("shareddll", n, "HKLM", SHARED_DLLS, "val", name=n, state=s)
+    return out
+
+
+def regclean_fix(it: dict) -> None:
+    if it["op"] == "val":
+        reg_del(it["root"], it["path"], it["name"])
+    elif it["op"] == "defval":
+        reg_del(it["root"], it["path"], "")
+    else:
+        reg_delete_tree(it["root"], it["path"])
+
+
 # ───────────────────────── Worker ─────────────────────────
 class Worker:
     def __init__(self):
@@ -2161,6 +2303,10 @@ def _qss(p: dict) -> str:
                     border-radius: 7px; selection-background-color: {p['accent']}; selection-color: #ffffff; }}
     QHeaderView::section {{ background: {p['panel2']}; color: {p['muted']}; border: none;
                             border-bottom: 1px solid {p['line']}; padding: 5px; font-weight: 600; }}
+    QTableView::indicator {{ width: 15px; height: 15px; border: 1px solid {p['muted']}; border-radius: 4px;
+                             background: {p['panel2']}; }}
+    QTableView::indicator:checked {{ background: {p['accent']}; border-color: {p['accent']};
+        image: url(none); }}
     QTableCornerButton::section {{ background: {p['panel2']}; border: none; }}
     QPlainTextEdit#log {{ background: {p['log_bg']}; color: {p['log_fg']}; border: 1px solid {p['line']};
                           border-radius: 7px; font-family: Consolas; font-size: 9pt; }}
@@ -2418,6 +2564,7 @@ class App(QMainWindow):
     PAGES = [("🖱", "Курсор", "Курсор"), ("🔊", "Звуки", "Звуки входа"),
              ("🚀", "Автозагрузка", "Автозагрузка (музыка при входе)"),
              ("🗑", "Программы", "Удаление программ и их остатков"), ("🩺", "Реестр", "Проверка реестра"),
+             ("🧽", "Чистка", "Чистка реестра"),
              ("⚙", "Службы", "Службы Windows"), ("🧭", "Браузеры", "Браузеры и ярлыки"),
              ("📋", "Меню", "Контекстное меню Проводника"), ("🏴", "Активаторы", "Следы активаторов"),
              ("🌐", "Сеть", "Сеть и DNS"), ("🔌", "Порты", "Порты"), ("🛠", "Система", "Система и инструменты"),
@@ -2473,7 +2620,7 @@ class App(QMainWindow):
         self.nav = QButtonGroup(self)
         self.nav_btns = []
         self.stack = QStackedWidget()
-        builders = [self._page_cursor, self._page_sound, self._page_startup, self._page_uninstall, self._page_registry,
+        builders = [self._page_cursor, self._page_sound, self._page_startup, self._page_uninstall, self._page_registry, self._page_regclean,
                     self._page_services, self._page_browsers, self._page_ctx, self._page_kms, self._page_net,
                     self._page_ports, self._page_system, self._page_undo, self._page_theme]
         for i, ((emo, short, tip), build) in enumerate(zip(self.PAGES, builders)):
@@ -3336,7 +3483,7 @@ class App(QMainWindow):
         def job():
             items = scan_fn(*args)
             bad = sum(1 for i in items if i.get("st") == "bad")
-            log.info(f"{'⚠' if bad else '✓'} {title}: {len(items)}" + (f", ✗ {bad}" if bad else ""))
+            log.info(f"{'⚠' if bad else '✓'} {title}: найдено {len(items)}" + (f", проблем {bad}" if bad else ""))
             ui(lambda: (setattr(self, attr, items), fill()))
         self.worker.run(title, job, journal=False)
 
@@ -3903,6 +4050,120 @@ class App(QMainWindow):
         if it and it["kind"] in ("reg", "regval"):
             acts.append(("🔎 Открыть в regedit", lambda: open_regedit(f"{it['root']}\\{it['rpath']}")))
         self._std_menu(self.lo_tbl, pos, acts)
+
+    # ── 🧽 чистка реестра ──
+    def _page_regclean(self, pl):
+        c, cl = _card("Что искать")
+        self.rc_cats = {}
+        tg = []
+        for key, title in RC_CATS:
+            t = Toggle(title)
+            t.setChecked(key not in self.cfg.get("rc_off", []))
+            self.rc_cats[key] = t
+            tg.append(t)
+        cl.addLayout(_row(*tg))
+        pl.addWidget(c)
+        c, cl = _card("Проблемы реестра")
+        self.rc_info = _lab("Нажмите «🔎 Сканировать».", "hint")
+        cl.addWidget(self.rc_info)
+        self.rc_tbl = _table(["", "Проблема", "Данные", "Ключ реестра"], 2)
+        self.rc_tbl.customContextMenuRequested.connect(self._rc_menu)
+        self.rc_tbl.itemChanged.connect(lambda *_: self._rc_count())
+        cl.addWidget(self.rc_tbl, 1)
+        b1 = self._scan_btn("🔎 Сканировать", "Поиск проблем по отмеченным категориям", self.regclean_refresh)
+        b2 = _btn("🧹 Исправить отмеченные", "danger", "Каждое удаление сохраняется в ↩ Откат", self._rc_fix)
+        self.busy_btns.append(b2)
+        cl.addLayout(_row(b1, b2, _btn("☑ Отметить всё", "", "", lambda: self._rc_check_all(True)),
+                          _btn("☐ Снять всё", "", "", lambda: self._rc_check_all(False))))
+        cl.addWidget(_lab("Отмечены только надёжные находки. ⚠ — файл на диске, который сейчас не подключён "
+                          "(флешка, сетевой диск): не отмечается — подключите диск или решите сами. "
+                          "Копия .reg не нужна: всё удалённое возвращает ↩ Откат.", "hint"))
+        pl.addWidget(c, 1)
+        self.rc_items: list = []
+
+    def regclean_refresh(self):
+        cats = [k for k, t in self.rc_cats.items() if t.isChecked()]
+        self.cfg["rc_off"] = [k for k, t in self.rc_cats.items() if not t.isChecked()]
+        if not cats:
+            return log.warning("⚠ Отметьте хотя бы одну категорию")
+        self._scan_into("Чистка реестра", regclean_scan, "rc_items", self._rc_fill, cats)
+
+    def _rc_fill(self):
+        t = self.rc_tbl
+        t.blockSignals(True)
+        t.setRowCount(len(self.rc_items))
+        for i, it in enumerate(self.rc_items):
+            chk = _cell("", tip=it["note"] or "")
+            chk.setFlags(chk.flags() | Qt.ItemIsUserCheckable)
+            chk.setCheckState(Qt.Checked if it["st"] == "bad" else Qt.Unchecked)
+            chk.setData(Qt.UserRole, it)
+            t.setItem(i, 0, chk)
+            t.setItem(i, 1, _cell(("⚠ " if it["st"] == "warn" else "") + it["title"],
+                                  _WARN if it["st"] == "warn" else None, tip=it["note"] or it["title"]))
+            t.setItem(i, 2, _cell(it["data"]))
+            t.setItem(i, 3, _cell(it["key"]))
+        t.blockSignals(False)
+        self._rc_count()
+
+    def _rc_checked(self):
+        t = self.rc_tbl
+        return [t.item(r, 0).data(Qt.UserRole) for r in range(t.rowCount())
+                if t.item(r, 0) and t.item(r, 0).checkState() == Qt.Checked]
+
+    def _rc_count(self):
+        n = len(self.rc_items)
+        by = {}
+        for it in self.rc_items:
+            by[it["title"]] = by.get(it["title"], 0) + 1
+        self.rc_info.setText(f"Найдено проблем: {n}, отмечено: {len(self._rc_checked())}" +
+                             ("   ·   " + ", ".join(f"{k}: {v}" for k, v in by.items()) if by else ""))
+
+    def _rc_check_all(self, on):
+        t = self.rc_tbl
+        t.blockSignals(True)
+        for r in range(t.rowCount()):
+            t.item(r, 0).setCheckState(Qt.Checked if on else Qt.Unchecked)
+        t.blockSignals(False)
+        self._rc_count()
+
+    def _rc_set_sel(self, on):
+        t = self.rc_tbl
+        t.blockSignals(True)
+        for r in self._sel_rows(t):
+            t.item(r, 0).setCheckState(Qt.Checked if on else Qt.Unchecked)
+        t.blockSignals(False)
+        self._rc_count()
+
+    def _rc_fix(self):
+        items = self._rc_checked()
+        if not items:
+            return log.warning("⚠ Нечего исправлять — отметьте строки")
+        if not self._ask(f"Исправить отмеченные проблемы реестра: {len(items)}?\n\nВсё удалённое можно вернуть "
+                         "на странице ↩ Откат."):
+            return
+
+        def job():
+            ok = 0
+            for it in items:
+                try:
+                    regclean_fix(it)
+                    ok += 1
+                    log.debug(f"исправлено: {it['title']} · {it['key']}")
+                except Exception as e:
+                    log.error(f"✗ {it['title']}: {it['data']} — {e}")
+            log.info(f"✓ Чистка реестра: исправлено {ok} из {len(items)}")
+        self.worker.run("чистка реестра", job, then=self.regclean_refresh)
+
+    def _rc_menu(self, pos):
+        rows = self._sel_rows(self.rc_tbl)
+        it = self.rc_tbl.item(rows[0], 0).data(Qt.UserRole) if rows else None
+        acts = [("☑ Отметить выбранные", lambda: self._rc_set_sel(True)),
+                ("☐ Снять с выбранных", lambda: self._rc_set_sel(False)), None,
+                ("🔎 Открыть в regedit", lambda: it and open_regedit(f"{it['root']}\\{it['path']}"))]
+        if it and it["cat"] in ("apppaths", "mui", "run", "installer", "firewall", "uninst", "shareddll"):
+            acts.append(("📂 Показать файл", lambda: show_in_explorer(it["data"].split(" — ")[-1].split(": ", 1)[-1])))
+        acts.append(("🔎 Сканировать заново", self.regclean_refresh))
+        self._std_menu(self.rc_tbl, pos, acts)
 
     # ── 🎨 тема ──
     def _page_theme(self, pl):
