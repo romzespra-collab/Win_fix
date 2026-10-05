@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-rem build_exe.bat  v1.3.4
+rem build_exe.bat  v1.3.5
 cd /d "%~dp0"
 echo === [1/4] Проверка Python ===
 python --version || (echo Python не найден & pause & exit /b 1)

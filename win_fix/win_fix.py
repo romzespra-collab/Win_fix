@@ -1,9 +1,11 @@
 r"""
-win_fix.py  v1.3.4
+win_fix.py  v1.3.5
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.3.5: заблокированные кнопки выглядят заблокированными (и primary/danger), подсказка «недоступно: выполняется …»
+        и строка «⏳ Выполняется» на странице 🛠; кнопка «⏹ Остановить» для DISM/SFC; ⏻ (нет в шрифтах) → 🔁.
 v1.3.4: курсор: подмена файлов определяется сверкой SHA256 с оригиналом из WinSxS, а не только по владельцу —
         оригиналы, восстановленные прошлой версией (владелец «Администраторы»), больше не считаются подменой;
         файлы C:\Windows\Cursors (в т.ч. не aero_*) — ✓, если совпадают с оригиналом; сверка при запуске в фоне;
@@ -64,7 +66,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.3.4"
+VERSION = "1.3.5"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -269,10 +271,24 @@ def run_ps(script: str, timeout: int = 120):
                     "-EncodedCommand", enc], timeout, label="PS> " + _short(script, 600))
 
 
+_STREAM = {"proc": None, "stopped": False}  # текущий DISM/SFC — для кнопки «⏹ Остановить»
+
+
+def stop_stream() -> bool:
+    p = _STREAM["proc"]
+    if p and p.poll() is None:
+        _STREAM["stopped"] = True
+        log.warning(f"⚠ Останавливаю {p.args[0]} (PID {p.pid})…")
+        run_cmd(["taskkill", "/PID", str(p.pid), "/T", "/F"]) if IS_WIN else p.kill()
+        return True
+    return False
+
+
 def run_stream(args, on_line) -> int:
     """Потоковый вывод (DISM/SFC). SFC пишет в UTF-16 — определяем сами."""
     log.debug(f"$ {' '.join(args)}  (поток)")
     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=NOWIN)
+    _STREAM["proc"] = p
     head = p.stdout.peek(256)[:256]
     enc = "utf-16-le" if head.count(b"\x00") > len(head) // 4 else _oem()
     last_pct = 0.0
@@ -1191,7 +1207,8 @@ def _qss(p: dict) -> str:
     QLabel#big {{ font-size: 13pt; font-weight: 600; }}
     QPushButton {{ background: {p['panel2']}; border: 1px solid {p['line']}; border-radius: 7px; padding: 6px 14px; }}
     QPushButton:hover {{ border-color: {p['accent']}; }}
-    QPushButton:disabled {{ color: {p['muted']}; }}
+    QPushButton:disabled, QPushButton#primary:disabled, QPushButton#danger:disabled {{
+        background: {p['panel2']}; border-color: {p['line']}; color: {p['muted']}; }}
     QPushButton#primary {{ background: {p['accent']}; border-color: {p['accent']}; color: #ffffff; font-weight: 600; }}
     QPushButton#primary:hover {{ background: {QColor(p['accent']).lighter(115).name()}; }}
     QPushButton#danger {{ background: transparent; border: 1px solid {_ERR}; color: {_ERR}; }}
@@ -1319,6 +1336,7 @@ def _btn(text, name="", tip="", slot=None):
         b.setObjectName(name)
     if tip:
         b.setToolTip(tip)
+        b.setProperty("tip", tip)
     if slot:
         b.clicked.connect(lambda _=False, t=text: log.debug(f"клик: {t}"))
         b.clicked.connect(slot)
@@ -1569,12 +1587,19 @@ class App(QMainWindow):
         self.pill.setStyleSheet(f"color:{_WARN};")
         for b in self.busy_btns:
             b.setEnabled(False)
+            b.setToolTip(f"Недоступно: выполняется «{title}»")
+        self.sys_busy.setStyleSheet(f"color:{_WARN};")
+        self.sys_busy.setText(f"⏳ Выполняется: {title}… Остальные действия станут доступны после окончания.")
+        self.sys_busy.show()
 
     def _done(self):
         self.pill.setText("● готов")
         self.pill.setStyleSheet(f"color:{_OK};")
         for b in self.busy_btns:
             b.setEnabled(True)
+            b.setToolTip(b.property("tip") or "")
+        self.sys_busy.hide()
+        self.b_stop.setEnabled(False)
 
     def _drain_log(self):
         for _ in range(500):
@@ -2171,8 +2196,14 @@ class App(QMainWindow):
                   lambda: self.sys_scan(True, True))
         b2 = _btn("DISM", "", "DISM /Online /Cleanup-Image /RestoreHealth", lambda: self.sys_scan(True, False))
         b3 = _btn("SFC", "", "sfc /scannow", lambda: self.sys_scan(False, True))
+        self.b_stop = _btn("⏹ Остановить", "danger", "Прервать DISM / SFC", self.sys_stop)
+        self.b_stop.setEnabled(False)
         self.busy_btns += [b1, b2, b3]
-        cl.addLayout(_row(b1, b2, b3))
+        cl.addLayout(_row(b1, b2, b3, self.b_stop))
+        self.sys_busy = _lab("", "hint")
+        self.sys_busy.setStyleSheet(f"color:{_WARN};")
+        self.sys_busy.hide()
+        cl.addWidget(self.sys_busy)
         cl.addWidget(_lab("Возвращает оригинальные системные файлы (в т.ч. подменённые курсоры, звуки, темы). "
                           "Нужен интернет и права администратора.", "hint"))
         pl.addWidget(c)
@@ -2181,7 +2212,7 @@ class App(QMainWindow):
         b4 = _btn("💾 Точка восстановления", "", "Создать перед правками", self.sys_restore_point)
         self.busy_btns.append(b4)
         cl.addLayout(_row(b4, _btn("🔄 Перезапустить Проводник", "", "", self.sys_explorer),
-                          _btn("⏻ Перезагрузка", "danger", "", self.sys_reboot)))
+                          _btn("🔁 Перезагрузка", "danger", "Перезагрузить компьютер через 10 с", self.sys_reboot)))
         pl.addWidget(c)
 
         c, cl = _card("Панели Windows")
@@ -2207,16 +2238,25 @@ class App(QMainWindow):
 
     def sys_scan(self, dism, sfc):
         def job():
+            _STREAM["stopped"] = False
             if dism:
                 log.info("⏳ DISM /RestoreHealth …")
                 code = run_stream(["DISM", "/Online", "/Cleanup-Image", "/RestoreHealth"], log.info)
                 (log.info if code == 0 else log.error)(f"{'✓' if code == 0 else '✗'} DISM завершён, код {code}")
+            if sfc and _STREAM["stopped"]:
+                return log.warning("⚠ Остановлено — SFC не запускался")
             if sfc:
                 log.info("⏳ sfc /scannow …")
                 code = run_stream(["sfc", "/scannow"], log.info)
                 (log.info if code == 0 else log.warning)(f"{'✓' if code == 0 else '⚠'} SFC завершён, код {code}"
                                                          " (подробно: C:\\Windows\\Logs\\CBS\\CBS.log)")
-        self.worker.run("проверка системы", job)
+        if self.worker.run("проверка системы", job):
+            self.b_stop.setEnabled(True)
+
+    def sys_stop(self):
+        if self._ask("Прервать проверку системы?\n(Повреждения не возникнет, но проверку придётся запустить заново.)"):
+            if not stop_stream():
+                log.info("Нечего останавливать")
 
     def sys_restore_point(self):
         def job():
