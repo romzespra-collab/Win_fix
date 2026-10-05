@@ -1,9 +1,21 @@
 r"""
-win_fix.py  v1.6.3
+win_fix.py  v1.7.0
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.7.0: правила чистки и удаления остатков — по коду открытых проектов, а не «на глаз»:
+        🧽 Чистка — как Little Registry Cleaner (github.com/little-apps, GPL): убрано выдуманное правило «пустой
+        класс»; добавлено: класс без файла иконки, ActiveX/COM (нет InprocServer32/LocalServer32, нет AppID),
+        App Paths с полем Path, пустые ключи и в HKLM, записи установки (DisplayIcon/InstallLocation/InstallSource,
+        ARPCache), шрифты, звуки событий, файлы справки, BHO/панели IE; проверка путей как у LRC: %переменные%,
+        «,индекс» у иконок, поиск по PATH для имён без папки, 32-битные записи — SysWOW64, сеть/CD — не трогаем;
+        FileExts — правило ValidateFileExt (UserChoice / OpenWithProgids / OpenWithList).
+        🙈 Исключения: правый клик «Никогда не трогать» (ключ или путь/папка), окно «Исключения…».
+        🗑 Остатки программ — баллы уверенности как в Bulk Crap Uninstaller (Apache 2.0): Sift4-сравнение имён,
+        папка издателя +4, путь установки +4, пустая папка +4, «используется другой программой» −7, похожая
+        программа −2, имя = издатель −2, подозрительное имя −3; уровни «очень вероятно / вероятно / сомнительно /
+        не трогать», заранее отмечено только «вероятно» и выше; глубина обхода ≤ 2 и чёрный список папок/ключей BCU.
 v1.6.3: ИСПРАВЛЕНО: «неверный класс» помечал ProgID COM-объектов Windows (Search.Indexer.1, Scriptlet.*,
         ComPlusDebug.CorDebug.1 …) — теперь они исключаются по HKCR\CLSID (64 и 32 бит); классы «только с
         описанием» — ⚠ без галочки; переключатель «неподключённые диски» отмечает только строки с дисками.
@@ -98,7 +110,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.6.3"
+VERSION = "1.7.0"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -1949,88 +1961,242 @@ def _human(n: int) -> str:
     return f"{n:.1f} ТБ"
 
 
-def leftovers_scan(app: dict) -> list:
-    """Остатки программы. st: bad — точно её (совпадение имени/папки), warn — похоже, проверьте."""
-    key, words, pub = _app_key(app["name"]), _words(app["name"]), _norm(app["pub"])
+def sift4(s1: str, s2: str, max_offset: int = 1) -> int:
+    """Sift4.SimplestDistance — порт из Bulk Crap Uninstaller (KlocTools, Apache 2.0)."""
+    l1, l2 = len(s1 or ""), len(s2 or "")
+    if not l1:
+        return l2
+    if not l2:
+        return l1
+    c1 = c2 = lcss = local = 0
+    while c1 < l1 and c2 < l2:
+        if s1[c1] == s2[c2]:
+            local += 1
+        else:
+            lcss += local
+            local = 0
+            if c1 != c2:
+                c1 = c2 = max(c1, c2)
+            for i in range(max_offset):
+                if not (c1 + i < l1 and c2 + i < l2):
+                    break
+                if s1[c1 + i] == s2[c2]:
+                    c1 += i - 1
+                    c2 -= 1
+                    break
+                if s1[c1] == s2[c2 + i]:
+                    c1 -= 1
+                    c2 += i - 1
+                    break
+        c1 += 1
+        c2 += 1
+    return max(l1, l2) - (lcss + local)
+
+
+# Баллы уверенности — значения ConfidenceRecords из Bulk Crap Uninstaller
+CONF = {"perfect": (2, "имя совпадает"), "dodgy": (-2, "имя похоже"), "company": (4, "папка/ключ издателя"),
+        "is_company": (-2, "имя = издатель"), "known": (-1, "прямо в системной папке"),
+        "questionable": (-3, "подозрительное имя (data, config…)"), "used": (-7, "используется другой программой"),
+        "explicit": (4, "прямая связь (путь установки)"), "uninst_key": (20, "запись деинсталлятора"),
+        "allsub": (4, "пустая / всё внутри — остатки"), "similar": (-2, "похожа на другую программу")}
+QUESTIONABLE = {"install", "settings", "config", "configuration", "users", "data"}
+DIR_BLACKLIST = {"microsoft", "microsoft games", "temp", "programs", "common", "common files", "clients", "downloads",
+                 "desktop", "internet explorer", "windows", "windows nt", "windows photo viewer", "windows mail",
+                 "windows defender", "windows media player", "uninstall information", "reference assemblies",
+                 "installshield installation information", "installer", "winsxs", "windowsapps", "directx",
+                 "directxredist", "packages", "start menu", "startup"}
+REG_BLACKLIST = {"microsoft", "wow6432node", "windows", "classes", "clients", "registeredapplications", "policies"}
+_CORP_TAIL = re.compile(r"[\s,.]*(corp|corporation|limited|ltd|inc|incorporated|llc|gmbh|co)\.?$", re.I)
+
+
+def _trim_name(name: str) -> str:
+    """DisplayNameTrimmed: без версии, разрядности, скобок."""
+    s = re.sub(r"\(.*?\)|\bv?\d+(\.\d+)+\w*\b|\b(x64|x86|64-bit|32-bit|64 bit|32 bit)\b", " ", name or "", flags=re.I)
+    return re.sub(r"\s+", " ", s).strip(" -_").lower()
+
+
+def _trim_pub(pub: str) -> str:
+    return _CORP_TAIL.sub("", (pub or "").replace("(R)", "").strip()).lower()
+
+
+def _match(app: dict, item: str) -> int:
+    """MatchStringToProductName из BCU: -1 нет; 0–1 точное; 2+ похожее."""
+    prod, s = _trim_name(app["name"]), item.replace("_", " ").lower().strip()
+    lo = min(len(prod), len(s))
+    if lo <= 4:
+        return -1
+    if _norm(prod) == _norm(s):  # наше дополнение к BCU: «SuperPlayer» = «Super Player»
+        return 0
+    r = sift4(prod, s, 1)
+    if r <= 1:
+        return r
+    pub = _trim_pub(app["pub"])
+    if len(pub) > 4 and pub in prod:
+        tp = prod.replace(pub, "").strip()
+        if len(tp) <= 4:
+            return -1
+        tr = sift4(tp, s, 1)
+        if tr <= 1:
+            return tr
+    if s in prod or prod in s:
+        return 2
+    return r if r < lo // 3 else -1
+
+
+def _confidence(app: dict, item: str, parent: str, level: int, known: bool) -> list:
+    """GenerateConfidence из BCU → список ключей CONF ([] — не связано с программой)."""
+    m = _match(app, item)
+    if m < 0:
+        return []
+    out = ["perfect" if m < 2 else "dodgy", ("level", 2 - abs(level) * 2)]
+    pub = _trim_pub(app["pub"])
+    if pub != _trim_name(app["name"]) and item.lower() in pub:
+        out.append("is_company")
+    if level > 0 and pub and os.path.basename(parent).replace("_", " ").lower() in pub:
+        out.append("company")
+    if known:
+        out.append("known")
+    if not any((c[1] if isinstance(c, tuple) else CONF[c][0]) > 0 for c in out):
+        return []
+    if item.lower() in QUESTIONABLE:
+        out.append("questionable")
+    return out
+
+
+def _score(conf: list) -> int:
+    return sum(c[1] if isinstance(c, tuple) else CONF[c][0] for c in conf)
+
+
+def _level(score: int) -> str:
+    """ConfidenceCollection.GetConfidence: <0 плохо, <2 сомнительно, <5 хорошо, иначе очень хорошо."""
+    return "bad" if score < 0 else "questionable" if score < 2 else "good" if score < 5 else "verygood"
+
+
+LEVEL_TXT = {"verygood": "✓✓ очень вероятно", "good": "✓ вероятно", "questionable": "? сомнительно",
+             "bad": "✗ не трогать"}
+
+
+def leftovers_scan(app: dict, all_apps=None) -> list:
+    """Остатки программы по методу Bulk Crap Uninstaller: каждой находке — баллы уверенности.
+    Отмечаются заранее только «вероятно» и «очень вероятно»."""
+    all_apps = all_apps if all_apps is not None else uninstall_list()
+    others = [a for a in all_apps if a["key"] != app["key"]]
+    other_locs = [_install_dir(a).lower() for a in others]
+    other_locs = [x for x in other_locs if x]
     inst = _install_dir(app)
     items, seen = [], set()
 
-    def add(kind, path, st, why, **kw):
-        if path.lower() in seen:
+    def still_used(path: str) -> bool:  # CheckIfDirIsStillUsed
+        p = path.lower().rstrip("\\")
+        return any(x.startswith(p) for x in other_locs)
+
+    def add(kind, path, conf, why="", **kw):
+        if path.lower() in seen:  # уже найдено другим способом — баллы складываются
+            ex = next(i for i in items if i["path"].lower() == path.lower())
+            ex["conf"] += [c for c in conf if c not in ex["conf"]]
             return
         seen.add(path.lower())
-        items.append(dict(kind=kind, path=path, st=st, why=why, **kw))
+        items.append(dict(kind=kind, path=path, conf=list(conf), why=why, **kw))
 
-    def match(name: str) -> str:
-        n = _norm(name)
-        if not n or n in PROTECT or n == pub:
-            return ""
-        if n == key or (len(key) >= 5 and (n.startswith(key) or (len(n) >= 5 and key.startswith(n)))):
-            return "bad"
-        if words and len(words[0]) >= 5 and n == _norm(words[0]):
-            return "warn"
-        return ""
+    def name_of(p):
+        return os.path.splitext(os.path.basename(p.rstrip("\\")))[0]
 
     if inst:
-        add("dir", inst, "bad", "папка установки")
+        conf = ["explicit"] + (["used"] if still_used(inst) else [])
+        add("dir", inst, conf)
     env = os.environ.get
     bases = [env("ProgramFiles", r"C:\Program Files"), env("ProgramFiles(x86)", r"C:\Program Files (x86)"),
              env("ProgramData", r"C:\ProgramData"), env("APPDATA", ""), env("LOCALAPPDATA", ""),
              os.path.join(env("LOCALAPPDATA", ""), "Programs"), os.path.join(env("USERPROFILE", ""), "AppData", "LocalLow"),
              os.path.join(env("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs"),
              os.path.join(env("ProgramData", ""), r"Microsoft\Windows\Start Menu\Programs")]
-    for b in bases:
-        if not b or not os.path.isdir(b):
-            continue
+    known = {b.lower().rstrip("\\") for b in bases if b}
+    win = WINDIR.lower()
+
+    def walk(d: str, level: int):  # CommonDriveJunkScanner.FindJunkRecursively (глубина ≤ 2)
+        added = []
         try:
-            children = list(os.scandir(b))
+            subs = [e for e in os.scandir(d) if e.is_dir(follow_symlinks=False)]
         except OSError:
-            continue
-        for e in children:
-            st = match(e.name)
-            if st:
-                add("dir" if e.is_dir() else "file", e.path, st, "имя совпадает")
-            elif e.is_dir() and pub and _norm(e.name) == pub:  # Издатель\Программа
+            return []
+        for e in subs:
+            low = e.path.lower()
+            if e.name.lower() in DIR_BLACKLIST or low.startswith(win) or low in known:
+                continue
+            conf = _confidence(app, e.name, d, level, d.lower().rstrip("\\") in known)
+            node = None
+            if conf:
+                if still_used(e.path):
+                    conf.append("used")
+                node = dict(kind="dir", path=e.path, conf=conf, why="")
+                added.append(node)
+            junk_below = walk(e.path, level + 1) if level <= 1 else []
+            added.extend(junk_below)
+            if node:
                 try:
-                    subs = list(os.scandir(e.path))
+                    files = [f for f in os.scandir(e.path) if f.is_file()]
+                    dirs = [f.path.lower() for f in os.scandir(e.path) if f.is_dir()]
                 except OSError:
-                    continue
-                hits = [s for s in subs if match(s.name)]
-                for s in hits:
-                    add("dir" if s.is_dir() else "file", s.path, match(s.name), "папка издателя → программа")
-                if (hits and len(hits) == len(subs)) or not subs:
-                    add("dir", e.path, "warn", "папка издателя (пустая без программы)")
-    # ярлыки на рабочих столах
+                    files, dirs = [None], []
+                if not files and all(any(j["path"].lower() == x for j in junk_below) for x in dirs):
+                    conf.append("allsub")
+        _similar(added)
+        return added
+
+    def _similar(nodes):  # TestForSimilarNames
+        this = _trim_name(app["name"])
+        for n in nodes:
+            nm = name_of(n["path"]).lower()
+            if any(nm in _trim_name(o["name"]) and this not in _trim_name(o["name"]) for o in others):
+                n["conf"].append("similar")
+
+    for b in bases:
+        if b and os.path.isdir(b):
+            for n in walk(b, 0):
+                add(n["kind"], n["path"], n["conf"])
+    # ярлыки (ShortcutJunk): ведут в папку программы, либо имя совпадает
     for d in (os.path.join(env("USERPROFILE", ""), "Desktop"), os.path.join(env("PUBLIC", ""), "Desktop")):
         if os.path.isdir(d):
             for e in os.scandir(d):
-                if e.name.lower().endswith(".lnk") and match(e.name[:-4]):
-                    add("file", e.path, "warn", "ярлык")
-    # реестр
+                if e.name.lower().endswith(".lnk"):
+                    conf = _confidence(app, e.name[:-4], d, 0, False)
+                    if conf:
+                        add("file", e.path, conf, "ярлык")
+    # реестр (SoftwareRegKeyScanner): Software\*, глубина ≤ 2, явная связь — путь установки в значениях
+    il = inst.lower()
+
+    def rwalk(root, path, level):
+        added = []
+        for sub in reg_subkeys(root, path):
+            if sub.lower() in REG_BLACKLIST:
+                continue
+            kp = rf"{path}\{sub}"
+            conf = _confidence(app, sub, path.rsplit("\\", 1)[-1], level, level == 0)
+            if il and any(isinstance(v, str) and il in v.lower()
+                          for n, v, _t in reg_values(root, kp)
+                          if n.lower() in ("installdir", "install_dir", "install directory", "instdir", "installpath",
+                                           "installlocation", "path", "applicationpath", "exe", "exepath",
+                                           "executable", "pathtoexe", "exe64", "exe32")):
+                conf = conf + ["explicit"] if conf else ["explicit"]
+            if conf:
+                added.append(dict(kind="reg", path=rf"{root}\{kp}", conf=conf, root=root, rpath=kp))
+            if level <= 1:
+                added.extend(rwalk(root, kp, level + 1))
+        _similar(added)
+        return added
+
     for root, base in (("HKCU", "Software"), ("HKLM", "SOFTWARE"), ("HKLM", r"SOFTWARE\WOW6432Node")):
-        for sub in reg_subkeys(root, base):
-            st = match(sub)
-            if st:
-                add("reg", rf"{root}\{base}\{sub}", st, "ключ программы", root=root, rpath=rf"{base}\{sub}")
-            elif pub and _norm(sub) == pub:
-                subs = reg_subkeys(root, rf"{base}\{sub}")
-                hits = [s for s in subs if match(s)]
-                for s in hits:
-                    add("reg", rf"{root}\{base}\{sub}\{s}", match(s), "ключ издателя → программа", root=root,
-                        rpath=rf"{base}\{sub}\{s}")
-                if (hits and len(hits) == len(subs)) or not (subs or reg_values(root, rf"{base}\{sub}")):
-                    add("reg", rf"{root}\{base}\{sub}", "warn", "ключ издателя (пустой без программы)", root=root,
-                        rpath=rf"{base}\{sub}")
+        for n in rwalk(root, base, 0):
+            add("reg", n["path"], n["conf"], root=n["root"], rpath=n["rpath"])
     if reg_key_exists(app["root"], app["key"]):
-        add("reg", rf"{app['root']}\{app['key']}", "warn", "запись «Программы и компоненты»", root=app["root"],
-            rpath=app["key"])
-    # автозагрузка, службы, задачи — по папке установки
+        add("reg", rf"{app['root']}\{app['key']}", ["uninst_key"], "запись «Программы и компоненты»",
+            root=app["root"], rpath=app["key"])
+    # автозагрузка, службы, задачи — по папке установки (прямая связь)
     if inst and IS_WIN:
-        il = inst.lower()
         for root, path, _appr in RUN_KEYS:
             for n, v, _t in reg_values(root, path):
                 if n and il in os.path.expandvars(str(v)).lower():
-                    add("regval", rf"{root}\{path}\{n}", "bad", "автозагрузка", root=root, rpath=path, rname=n)
+                    add("regval", rf"{root}\{path}\{n}", ["explicit"], "автозагрузка", root=root, rpath=path, rname=n)
         _c, out, _ = run_ps(
             f"$p={ps_quote(il)};@(Get-CimInstance Win32_Service | ?{{ $_.PathName -and $_.PathName.ToLower().Contains($p) }} |"
             " %{[pscustomobject]@{k='svc';n=$_.Name;v=$_.PathName}}) + @(Get-ScheduledTask | ?{ (($_.Actions | "
@@ -2041,15 +2207,22 @@ def leftovers_scan(app: dict) -> list:
             res = json.loads(out or "[]")
             for r in [res] if isinstance(res, dict) else res:
                 if r["k"] == "svc":
-                    add("svc", f"служба {r['n']}", "bad", r["v"], name=r["n"])
+                    add("svc", f"служба {r['n']}", ["explicit"], r["v"], name=r["n"])
                 else:
-                    add("task", f"задача {r.get('p', '')}{r['n']}", "bad", r["v"], name=r["n"], tpath=r.get("p", "\\"))
+                    add("task", f"задача {r.get('p', '')}{r['n']}", ["explicit"], r["v"], name=r["n"],
+                        tpath=r.get("p", "\\"))
         except Exception:
             log.debug("службы/задачи программы не прочитаны", exc_info=True)
     for it in items:
+        it["score"] = _score(it["conf"])
+        it["lvl"] = _level(it["score"])
+        it["st"] = "bad" if it["lvl"] in ("good", "verygood") else "warn"  # «bad» = отмечается заранее
+        reasons = [f"{CONF[c][0]:+d} {CONF[c][1]}" if not isinstance(c, tuple) else f"{c[1]:+d} глубина"
+                   for c in it["conf"]]
+        it["why"] = (it["why"] + " · " if it["why"] else "") + ", ".join(reasons)
         it["size"] = _human(_dir_size(it["path"])) if it["kind"] == "dir" else \
             (_human(os.path.getsize(it["path"])) if it["kind"] == "file" and os.path.exists(it["path"]) else "")
-    items.sort(key=lambda i: (i["st"] != "bad", i["kind"], i["path"].lower()))
+    items.sort(key=lambda i: (-i["score"], i["kind"], i["path"].lower()))
     return items
 
 
@@ -2078,12 +2251,17 @@ def backup_size() -> int:
     return _dir_size(str(BACKUP_DIR / "uninstall"), 5) if (BACKUP_DIR / "uninstall").is_dir() else 0
 
 
-# ───────────────────────── чистка реестра (как CCleaner) ─────────────────────────
-RC_CATS = [("fileexts", "Неиспользуемые расширения файлов"), ("badclass", "Неверный или пустой класс файлов"),
+# ───────────────────────── чистка реестра ─────────────────────────
+# Правила — по образцу Little Registry Cleaner (github.com/little-apps, GPL): проверяются только ссылки на файлы,
+# классы, CLSID и AppID, которых нет. «Пустые классы» и прочие догадки — не ищем (дают ложные срабатывания).
+RC_CATS = [("fileexts", "Неиспользуемые расширения файлов"), ("badclass", "Расширение → нет класса"),
+           ("classicon", "Класс: нет файла иконки"), ("com", "ActiveX/COM: нет файла или AppID"),
            ("apppaths", "Ошибки путей приложений"), ("installer", "Ошибки установки приложений"),
-           ("software", "Пустой программный ключ"), ("firewall", "Неверное правило брандмауэра"),
-           ("mui", "Устаревшие ссылки MUI"), ("run", "Автозагрузка: файла нет"),
-           ("uninst", "Устаревшая запись установки"), ("shareddll", "Отсутствующие общие DLL")]
+           ("software", "Пустой программный ключ"), ("uninst", "Записи установки: неверные пути"),
+           ("firewall", "Неверное правило брандмауэра"), ("mui", "Устаревшие ссылки MUI"),
+           ("run", "Автозагрузка: файла нет"), ("shareddll", "Отсутствующие общие DLL"),
+           ("fonts", "Шрифты: файла нет"), ("sounds", "Звуки событий: файла нет"), ("help", "Файлы справки: нет"),
+           ("explorer", "Надстройки IE/Проводника: нет CLSID")]
 RC_TITLE = dict(RC_CATS)
 FILEEXTS = r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts"
 MUICACHE = r"Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache"
@@ -2093,21 +2271,72 @@ APP_PATHS = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
 INSTALLER_FOLDERS = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\Folders"
 FW_RULES = r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules"
 SHARED_DLLS = r"SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs"
+FONTS_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
+ARP_CACHE = r"Software\Microsoft\Windows\CurrentVersion\App Management\ARPCache"
+SOFTWARE_SKIP = {"microsoft", "wow6432node", "windows", "classes", "clients", "policies", "registeredapplications"}
+DRIVE_REMOVABLE, DRIVE_REMOTE, DRIVE_CDROM, DRIVE_NO_ROOT = 2, 4, 5, 1
+_IS_WOW64 = IS_WIN and sys.maxsize <= 2 ** 32 and "PROGRAMFILES(X86)" in os.environ
 
 
-def _path_state(p: str) -> str:
-    """ok — есть; missing — нет; nodrive — диск не подключён (флешка/сеть): не трогаем; skip — не путь."""
-    p = os.path.expandvars(str(p or "").strip().strip('"')).rstrip("\\") or ""
-    if not p or p.startswith(("@", "\\\\?\\", "\\Device", "%")) or "://" in p:
+def _drive_type(root: str) -> int:
+    try:
+        return ctypes.windll.kernel32.GetDriveTypeW(root)
+    except Exception:
+        return 3
+
+
+def _sanitize(p: str, icon: bool = False) -> str:
+    """Как Utils.SanitizeFilePath в Little Registry Cleaner: кавычки, %переменные%, @, «,индекс» у иконок."""
+    p = str(p or "").strip()
+    if icon:
+        p = p.lstrip("@")
+        if p.startswith('"'):
+            p = p[1:].split('"', 1)[0]
+        elif "," in p:
+            p = p.rsplit(",", 1)[0]
+    p = os.path.expandvars(p.strip().strip('"')).strip()
+    return "" if re.search(r'[<>|"*?]', p) else p
+
+
+def _search_path(name: str, wow32: bool = False) -> bool:
+    """SearchPath: имя без папки ищется в System32 и PATH (как делает Windows)."""
+    dirs = [os.path.join(WINDIR, "SysWOW64" if wow32 else "System32"), WINDIR] + os.environ.get("PATH", "").split(os.pathsep)
+    exts = ("",) if os.path.splitext(name)[1] else ("", ".exe", ".dll")
+    return any(os.path.isfile(os.path.join(d, name + e)) for d in dirs if d for e in exts)
+
+
+def _path_state(p: str, icon: bool = False, wow32: bool = False, kind: str = "any") -> str:
+    """ok — есть; missing — нет; nodrive — диска нет (флешка/сеть отключены); skip — не путь / не проверяем."""
+    raw = str(p or "").strip()
+    if raw.startswith(("@{", "{")) or "ms-resource:" in raw.lower() or "ms-appx" in raw.lower():
+        return "skip"  # ресурсы приложений Магазина — не пути
+    p = _sanitize(p, icon)
+    if len(p) > 3:
+        p = p.rstrip("\\")  # «C:\\Folder\\» → «C:\\Folder»
+    if not p or p in ("%1", "%l") or p.startswith(("\\\\?\\", "\\Device", "%")) or "://" in p:
         return "skip"
-    drive, _rest = os.path.splitdrive(p)
-    if drive.startswith("\\\\"):  # сетевой путь — сеть может быть недоступна
-        return "nodrive" if not os.path.exists(drive + "\\") else ("ok" if os.path.exists(p) else "missing")
-    if IS_WIN and not drive:
-        return "skip"
-    if drive and not os.path.exists(drive + "\\"):
-        return "nodrive"
-    return "ok" if os.path.exists(p) else "missing"
+    if wow32:  # 32-битная запись: System32 означает SysWOW64
+        p = re.sub(r"(?i)\\system32\\", r"\\SysWOW64\\", p)
+    elif _IS_WOW64:  # 32-битный Python видит SysWOW64 вместо System32
+        p = re.sub(r"(?i)\\system32\\", r"\\Sysnative\\", p)
+    drive, _r = os.path.splitdrive(p)
+    if not drive and not os.path.isabs(p):
+        if not os.path.splitext(p)[1] or os.sep in p or "/" in p:
+            return "skip"  # не имя файла (или относительный путь) — не проверяем
+        return "ok" if _search_path(p, wow32) else "missing"
+    if drive:
+        root = drive + "\\"
+        dt = _drive_type(root) if IS_WIN else 3
+        if dt in (DRIVE_NO_ROOT, 0) or not os.path.exists(root):
+            return "nodrive"
+        if dt in (DRIVE_REMOTE, DRIVE_CDROM):  # сеть/диск — могут быть недоступны временно: не трогаем
+            return "skip"
+    ok = os.path.isdir(p) if kind == "dir" else os.path.isfile(p) if kind == "file" else os.path.exists(p)
+    return "ok" if ok else "missing"
+
+
+def _bad(st: str) -> bool:
+    return st in ("missing", "nodrive")
 
 
 def _rc_item(cat, data, root, path, op, name=None, state="missing"):
@@ -2117,36 +2346,38 @@ def _rc_item(cat, data, root, path, op, name=None, state="missing"):
                 note="диск не подключён (флешка/сеть) — не отмечено" if nodrive else "")
 
 
-def _com_progids() -> set:
-    """ProgID и VersionIndependentProgID всех COM-классов (64 и 32 бит)."""
-    out = set()
-    for base in ("CLSID", r"WOW6432Node\CLSID"):
-        for c in reg_subkeys("HKCR", base):
-            for sub in ("ProgID", "VersionIndependentProgID"):
-                v = reg_get("HKCR", rf"{base}\{c}\{sub}", "")
-                if isinstance(v, str) and v:
-                    out.add(v.lower())
-    return out
+def _classes_roots():
+    """(корень, путь, 32-бит?): HKCR (это сразу HKLM+HKCU Classes) и его Wow6432Node — как в Little Registry Cleaner."""
+    out = [("HKCR", "", False), ("HKCR", "Wow6432Node", True)]
+    return [(r, p, w) for r, p, w in out if p == "" or reg_key_exists(r, p)]
+
+
+def _key_exists_any(path: str) -> bool:
+    return reg_key_exists("HKCR", path) or reg_key_exists("HKCR", rf"Wow6432Node\{path}")
 
 
 def _ext_used(ext: str) -> bool:
-    """Расширение кому-то нужно: есть класс в HKCR, выбор по умолчанию или «Открыть с помощью» живой программой."""
-    if reg_key_exists("HKCR", ext):
-        return True
+    """Как ValidateFileExt в LRC: есть UserChoice, живой OpenWithProgids или программа из OpenWithList.
+    Плюс наша страховка: расширение зарегистрировано в HKCR."""
     base = rf"{FILEEXTS}\{ext}"
-    uc = reg_get("HKCU", base + r"\UserChoice", "ProgId")
-    if uc and reg_key_exists("HKCR", uc):
+    if reg_key_exists("HKCU", base + r"\UserChoice") or reg_key_exists("HKCR", ext):
         return True
     for n, _v, _t in reg_values("HKCU", base + r"\OpenWithProgids"):
-        if n and reg_key_exists("HKCR", n):
+        if n and _key_exists_any(n):
             return True
     for n, v, _t in reg_values("HKCU", base + r"\OpenWithList"):
-        if n.lower() != "mrulist" and isinstance(v, str) and v and reg_key_exists("HKCR", rf"Applications\{v}"):
+        if n.lower() != "mrulist" and isinstance(v, str) and v and _key_exists_any(rf"Applications\{v}"):
             return True
     return False
 
 
-def regclean_scan(cats=None) -> list:
+def rc_ignored(it: dict, ignore: list) -> bool:
+    low = [x.lower() for x in ignore]
+    return it["key"].lower() in low or it["data"].lower() in low or \
+        any(it["data"].lower().startswith(x.rstrip("\\") + "\\") for x in low if len(x) > 3)
+
+
+def regclean_scan(cats=None, ignore=None) -> list:
     cats = set(cats or dict(RC_CATS))
     out = []
 
@@ -2155,97 +2386,171 @@ def regclean_scan(cats=None) -> list:
 
     if "fileexts" in cats:
         for ext in reg_subkeys("HKCU", FILEEXTS):
-            if ext == "." or (ext.startswith(".") and not _ext_used(ext)):  # DDECache, OpenWithList — служебные
+            if ext.startswith(".") and not _ext_used(ext):  # DDECache, OpenWithList — служебные, пропуск
                 add("fileexts", ext, "HKCU", rf"{FILEEXTS}\{ext}", "tree")
-    if "badclass" in cats:
-        keys = reg_subkeys("HKCR", "")
-        used = set()  # на какие классы ссылаются расширения
-        for k in keys:
-            if k.startswith("."):
-                prog = reg_get("HKCR", k, "")
-                if isinstance(prog, str) and prog.strip():
-                    used.add(prog.lower())
-                    if not reg_key_exists("HKCR", prog):
-                        add("badclass", f"{k} → {prog}", "HKCR", k, "defval")
-                used.update(n.lower() for n, _v, _t in reg_values("HKCR", rf"{k}\OpenWithProgids"))
-        com = _com_progids()  # ProgID COM-объектов (Search.Indexer.1, Scriptlet.* …) — не трогаем никогда
-        for k in keys:
-            kl = k.lower()
-            if "." not in k or k.startswith((".", "*", "{")) or kl in used or kl in com or reg_subkeys("HKCR", k):
-                continue
-            names = {n.lower() for n, _v, _t in reg_values("HKCR", k)}
-            if not names:
-                add("badclass", k, "HKCR", k, "tree")  # совсем пустой ключ
-            elif names <= {"", "friendlytypename", "editflags", "infotip"}:
-                it = _rc_item("badclass", k, "HKCR", k, "tree")
-                it.update(st="warn", note="только описание, без команд — похоже на остаток, проверьте")
-                out.append(it)
+    if "badclass" in cats or "classicon" in cats:
+        for root, base, w32 in _classes_roots():
+            for k in reg_subkeys(root, base):
+                kp = rf"{base}\{k}" if base else k
+                if k.startswith(".") and "badclass" in cats:
+                    prog = reg_get(root, kp, "")
+                    if isinstance(prog, str) and prog.strip() and not _key_exists_any(prog):
+                        add("badclass", f"{k} → {prog}", root, kp, "defval")
+                elif not k.startswith((".", "*", "{")) and "classicon" in cats and k.lower() not in ("clsid", "appid"):
+                    icon = reg_get(root, rf"{kp}\DefaultIcon", "")
+                    if isinstance(icon, str) and icon.strip():
+                        s = _path_state(icon, icon=True, wow32=w32, kind="file")
+                        if _bad(s):
+                            add("classicon", f"{k}: {icon}", root, rf"{kp}\DefaultIcon", "tree", state=s)
+    if "com" in cats:
+        for root, base, w32 in _classes_roots():
+            cl = rf"{base}\CLSID" if base else "CLSID"
+            for c in reg_subkeys(root, cl):
+                k = rf"{cl}\{c}"
+                for srv in ("InprocServer32", "InprocServer", "LocalServer32"):
+                    v = reg_get(root, rf"{k}\{srv}", "")
+                    if isinstance(v, str) and v.strip():
+                        s = _path_state(exe_from_cmd(v) if srv == "LocalServer32" else v, wow32=w32, kind="file")
+                        if _bad(s):
+                            add("com", f"{c} {srv}: {v}", root, rf"{k}\{srv}", "tree", state=s)
+                appid = reg_get(root, k, "AppID")
+                if isinstance(appid, str) and GUID_RE.match(appid) and not _key_exists_any(rf"AppID\{appid}"):
+                    add("com", f"{c}: AppID {appid} нет", root, k, "val", name="AppID")
+            ap = rf"{base}\AppID" if base else "AppID"
+            for a in reg_subkeys(root, ap):  # AppID\program.exe → AppID {guid}, которого нет
+                ref = reg_get(root, rf"{ap}\{a}", "AppID")
+                if not GUID_RE.match(a) and isinstance(ref, str) and GUID_RE.match(ref) \
+                        and not _key_exists_any(rf"AppID\{ref}"):
+                    add("com", f"{a} → AppID {ref} нет", root, rf"{ap}\{a}", "tree")
     if "apppaths" in cats:
+        for n, _v, _t in reg_values("HKCU", COMPAT_STORE):
+            s = _path_state(n, kind="file")
+            if _bad(s):
+                add("apppaths", n, "HKCU", COMPAT_STORE, "val", name=n, state=s)
         for root in ("HKCU", "HKLM"):
-            store = COMPAT_STORE if root == "HKCU" else None
-            for base in filter(None, (store, COMPAT_LAYERS)):
-                for n, _v, _t in reg_values(root, base):
-                    s = _path_state(n)
-                    if s in ("missing", "nodrive"):
-                        add("apppaths", n, root, base, "val", name=n, state=s)
-            ap = APP_PATHS if root == "HKLM" else r"Software\Microsoft\Windows\CurrentVersion\App Paths"
-            for exe in reg_subkeys(root, ap):
-                v = reg_get(root, rf"{ap}\{exe}", "")
-                s = _path_state(v)
-                if s in ("missing", "nodrive"):
-                    add("apppaths", v, root, rf"{ap}\{exe}", "tree", state=s)
+            for n, _v, _t in reg_values(root, COMPAT_LAYERS):
+                s = _path_state(n, kind="file")
+                if _bad(s):
+                    add("apppaths", n, root, COMPAT_LAYERS, "val", name=n, state=s)
+        for exe in reg_subkeys("HKLM", APP_PATHS):  # как ScanAppPaths в LRC
+            k = rf"{APP_PATHS}\{exe}"
+            if reg_get("HKLM", k, "BlockOnTSNonInstallMode") == 1:
+                continue
+            app, d = reg_get("HKLM", k, ""), reg_get("HKLM", k, "Path")
+            if not isinstance(app, str) or not app.strip():
+                add("apppaths", f"{exe}: путь пуст", "HKLM", k, "tree")
+                continue
+            s = _path_state(app, kind="file")
+            if _bad(s) and isinstance(d, str) and d.strip():
+                for cand in (os.path.join(_sanitize(d), os.path.basename(_sanitize(app))), os.path.join(_sanitize(d), exe)):
+                    if os.path.isfile(cand):
+                        s = "ok"
+            if _bad(s):
+                add("apppaths", app, "HKLM", k, "tree", state=s)
     if "installer" in cats:
         for n, _v, _t in reg_values("HKLM", INSTALLER_FOLDERS):
-            s = _path_state(n)
-            if s in ("missing", "nodrive"):
+            s = _path_state(n, kind="dir")
+            if _bad(s):
                 add("installer", n, "HKLM", INSTALLER_FOLDERS, "val", name=n, state=s)
-    if "software" in cats:
-        for k in reg_subkeys("HKCU", "Software"):
-            if _norm(k) not in PROTECT and not reg_values("HKCU", rf"Software\{k}") and \
-                    not reg_subkeys("HKCU", rf"Software\{k}"):
-                add("software", k, "HKCU", rf"Software\{k}", "tree")
+    if "software" in cats:  # как ApplicationSettings в LRC: ключ без значений (и без «по умолчанию») и без подключей
+        for root, base in (("HKCU", "Software"), ("HKLM", "SOFTWARE"), ("HKLM", r"SOFTWARE\WOW6432Node")):
+            for k in reg_subkeys(root, base):
+                if k.lower() in SOFTWARE_SKIP:
+                    continue
+                kp = rf"{base}\{k}"
+                if not reg_values(root, kp) and not reg_subkeys(root, kp):
+                    add("software", k, root, kp, "tree")
+    if "uninst" in cats:  # как ApplicationInfo в LRC: ссылки записи на несуществующие файлы/папки
+        for root, base in UNINST_KEYS:
+            for sub in reg_subkeys(root, base):
+                k = rf"{base}\{sub}"
+                vals = {n.lower(): v for n, v, _t in reg_values(root, k)}
+                if not vals:
+                    add("uninst", f"{sub}: пустая запись", root, k, "tree")
+                    continue
+                if vals.get("windowsinstaller") == 1:
+                    continue
+                if not vals.get("displayname") and not vals.get("uninstallstring"):
+                    add("uninst", f"{sub}: нет имени и деинсталлятора", root, k, "tree")
+                    continue
+                for vn, kind, icon in (("DisplayIcon", "file", True), ("InstallLocation", "any", False),
+                                       ("InstallSource", "any", False)):
+                    v = vals.get(vn.lower())
+                    if isinstance(v, str) and v.strip():
+                        s = _path_state(v, icon=icon, kind=kind)
+                        if _bad(s):
+                            add("uninst", f"{vals.get('displayname') or sub} · {vn}: {v}", root, k, "val", name=vn,
+                                state=s)
+        for root in ("HKLM", "HKCU"):  # ARPCache: кэш программ, которых уже нет
+            for sub in reg_subkeys(root, ARP_CACHE):
+                if not any(reg_key_exists(r, rf"{b}\{sub}") for r, b in UNINST_KEYS):
+                    add("uninst", f"{sub}: кэш удалённой программы", root, rf"{ARP_CACHE}\{sub}", "tree")
     if "firewall" in cats:
         for n, v, _t in reg_values("HKLM", FW_RULES):
             m = re.search(r"\|App=([^|]+)", str(v))
             if m:
-                s = _path_state(m.group(1))
-                if s in ("missing", "nodrive"):
+                s = _path_state(m.group(1), kind="file")
+                if _bad(s):
                     rn = re.search(r"\|Name=([^|]+)", str(v))
-                    add("firewall", f"{n} — {m.group(1)}" + (f" ({rn.group(1)})" if rn else ""), "HKLM", FW_RULES,
+                    add("firewall", f"{m.group(1)}" + (f" ({rn.group(1)})" if rn else ""), "HKLM", FW_RULES,
                         "val", name=n, state=s)
     if "mui" in cats:
         for n, _v, _t in reg_values("HKCU", MUICACHE):
-            if n.startswith("@") or "." not in n:
+            if n.startswith("@") or "." not in n or n.lower() == "langid":
                 continue
-            path = n.rsplit(".", 1)[0]  # «C:\x\app.exe.FriendlyAppName» → «C:\x\app.exe»
-            s = _path_state(path)
-            if s in ("missing", "nodrive"):
+            s = _path_state(n.rsplit(".", 1)[0], kind="file")  # «C:\x\app.exe.FriendlyAppName» → «C:\x\app.exe»
+            if _bad(s):
                 add("mui", n, "HKCU", MUICACHE, "val", name=n, state=s)
-    if "run" in cats:
+    if "run" in cats:  # как StartupFiles в LRC
         for root, path, _appr in RUN_KEYS:
             for n, v, _t in reg_values(root, path):
                 exe = exe_from_cmd(str(v))
-                if n and os.path.isabs(os.path.expandvars(exe)):
-                    s = _path_state(exe)
-                    if s in ("missing", "nodrive"):
+                if n and exe:
+                    s = _path_state(exe, kind="file")
+                    if _bad(s):
                         add("run", f"{n}: {v}", root, path, "val", name=n, state=s)
-    if "uninst" in cats:
-        for root, base in UNINST_KEYS:
-            for sub in reg_subkeys(root, base):
-                k = rf"{base}\{sub}"
-                cmd = str(reg_get(root, k, "UninstallString") or "")
-                if not cmd or re.search(r"msiexec", cmd, re.I) or reg_get(root, k, "SystemComponent") == 1:
-                    continue
-                exe = exe_from_cmd(cmd)
-                loc = str(reg_get(root, k, "InstallLocation") or "").strip().strip('"')
-                s = _path_state(exe)
-                if s in ("missing", "nodrive") and (not loc or _path_state(loc) != "ok"):
-                    add("uninst", f"{reg_get(root, k, 'DisplayName') or sub}: {cmd}", root, k, "tree", state=s)
     if "shareddll" in cats:
         for n, _v, _t in reg_values("HKLM", SHARED_DLLS):
-            s = _path_state(n)
-            if s in ("missing", "nodrive"):
+            s = _path_state(n, kind="file")
+            if _bad(s):
                 add("shareddll", n, "HKLM", SHARED_DLLS, "val", name=n, state=s)
+    if "fonts" in cats:  # как WindowsFonts в LRC: имя файла ищется и как путь, и в папке Fonts
+        fdir = os.path.join(WINDIR, "Fonts")
+        for n, v, _t in reg_values("HKLM", FONTS_KEY):
+            if isinstance(v, str) and v.strip():
+                s = _path_state(v if os.path.isabs(_sanitize(v)) else os.path.join(fdir, v), kind="file")
+                if _bad(s):
+                    add("fonts", f"{n}: {v}", "HKLM", FONTS_KEY, "val", name=n, state=s)
+    if "sounds" in cats:  # как WindowsSounds в LRC: .Current/.Modified со ссылкой на нет файла
+        media = os.path.join(WINDIR, "Media")
+        for app in reg_subkeys("HKCU", SND_APPS):
+            for ev in reg_subkeys("HKCU", rf"{SND_APPS}\{app}"):
+                for sub in (".Current", ".Modified"):
+                    k = rf"{SND_APPS}\{app}\{ev}\{sub}"
+                    v = reg_get("HKCU", k, "")
+                    if isinstance(v, str) and v.strip():
+                        p = v if os.path.isabs(_sanitize(v)) else os.path.join(media, v)
+                        s = _path_state(p, kind="file")
+                        if _bad(s):
+                            add("sounds", f"{app}\\{ev}: {v}", "HKCU", k, "defval", state=s)
+    if "help" in cats:  # как WindowsHelpFiles в LRC: имя файла — значение, папка — данные
+        for k in (r"SOFTWARE\Microsoft\Windows\HTML Help", r"SOFTWARE\Microsoft\Windows\Help"):
+            for n, v, _t in reg_values("HKLM", k):
+                if n and isinstance(v, str) and v.strip():
+                    s = _path_state(os.path.join(_sanitize(v), n), kind="file")
+                    if _bad(s) and _path_state(n, kind="file") != "ok":
+                        add("help", f"{n} → {v}", "HKLM", k, "val", name=n, state=s)
+    if "explorer" in cats:  # как ScanExplorer в LRC: BHO и панели IE с несуществующим CLSID
+        bho = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects"
+        for g in reg_subkeys("HKLM", bho):
+            if GUID_RE.match(g) and not _key_exists_any(rf"CLSID\{g}"):
+                add("explorer", f"BHO {g}", "HKLM", rf"{bho}\{g}", "tree")
+        tb = r"SOFTWARE\Microsoft\Internet Explorer\Toolbar"
+        for n, _v, _t in reg_values("HKLM", tb):
+            if GUID_RE.match(n) and not _key_exists_any(rf"CLSID\{n}"):
+                add("explorer", f"Панель IE {n}", "HKLM", tb, "val", name=n)
+    if ignore:
+        out = [i for i in out if not rc_ignored(i, ignore)]
     return out
 
 
@@ -3997,18 +4302,19 @@ class App(QMainWindow):
         c, cl = _card("Остатки")
         self.lo_title = _lab("Выберите программу и нажмите «🗑 Удалить программу» или «🔎 Найти остатки».", "hint")
         cl.addWidget(self.lo_title)
-        self.lo_tbl = _table(["Статус", "Тип", "Где", "Размер", "Почему"], 2)
+        self.lo_tbl = _table(["Уверенность", "Тип", "Где", "Размер", "Почему (баллы как в Bulk Crap Uninstaller)"], 2)
         self.lo_tbl.customContextMenuRequested.connect(self._lo_menu)
         cl.addWidget(self.lo_tbl, 1)
         b4 = _btn("🧹 Удалить выбранные остатки", "primary", "Файлы → backup\\uninstall, реестр — с копией (↩ Откат)",
                   self._lo_delete)
         self.busy_btns.append(b4)
-        cl.addLayout(_row(b4, _btn("✓ Выделить надёжные", "", "Только ✗ — точно этой программы", self._lo_select_sure),
+        cl.addLayout(_row(b4, _btn("✓ Выделить надёжные", "", "Только «вероятно» и «очень вероятно»", self._lo_select_sure),
                           _btn("🗑 Очистить backup\\uninstall", "danger", "Удалить навсегда перенесённые файлы",
                                self._lo_purge)))
-        cl.addWidget(_lab("✗ — точно этой программы (папка установки, совпадает имя). ⚠ — похоже, проверьте перед "
-                          "удалением. Файлы не стираются, а переносятся в backup\\uninstall — откат вернёт их; "
-                          "место освобождает «Очистить backup\\uninstall».", "hint"))
+        cl.addWidget(_lab("Уверенность считается как в Bulk Crap Uninstaller: + совпадение имени, папка издателя, "
+                          "путь установки, пустая папка; − папкой пользуется другая программа (−7), имя похоже на "
+                          "другую программу, подозрительное имя. Заранее отмечено только «вероятно». Файлы не "
+                          "стираются, а переносятся в backup\\uninstall — ↩ Откат вернёт их.", "hint"))
         pl.addWidget(c, 2)
         self.ap_items: list = []
         self.lo_items: list = []
@@ -4062,9 +4368,9 @@ class App(QMainWindow):
 
     def _lo_scan_job(self, a):
         log.info(f"⏳ Ищу остатки «{a['name']}»…")
-        items = leftovers_scan(a)
+        items = leftovers_scan(a, self.ap_items or None)
         sure = sum(1 for i in items if i["st"] == "bad")
-        log.info(f"{'⚠' if items else '✓'} Остатки «{a['name']}»: {len(items)}" + (f" (✗ точно: {sure})" if sure else ""))
+        log.info(f"{'⚠' if items else '✓'} Остатки «{a['name']}»: {len(items)}" + (f" (вероятных: {sure})" if sure else ""))
         ui(lambda: self._lo_show(a, items))
 
     def _lo_show(self, a, items):
@@ -4079,7 +4385,9 @@ class App(QMainWindow):
         kinds = {"dir": "📁 папка", "file": "📄 файл", "reg": "🧬 реестр", "regval": "🚀 автозагрузка",
                  "svc": "⚙ служба", "task": "🗓 задача"}
         for i, it in enumerate(self.lo_items):
-            t.setItem(i, 0, _cell("✗ точно" if it["st"] == "bad" else "⚠ похоже", ST_COLOR[it["st"]]))
+            lv = it.get("lvl", "good")
+            t.setItem(i, 0, _cell(LEVEL_TXT[lv], {"verygood": _OK, "good": _OK, "questionable": _WARN, "bad": _ERR}[lv],
+                                  tip=f"баллы: {it.get('score', 0):+d}"))
             t.setItem(i, 1, _cell(kinds.get(it["kind"], it["kind"])))
             t.setItem(i, 2, _cell(it["path"]))
             t.setItem(i, 3, _cell(it.get("size", "")))
@@ -4098,10 +4406,10 @@ class App(QMainWindow):
         name = self.lo_app["name"] if self.lo_app else "app"
         if not sel:
             return log.warning("⚠ Выберите остатки")
-        warn = sum(1 for i in sel if i["st"] != "bad")
+        warn = sum(1 for i in sel if i.get("lvl") in ("questionable", "bad"))
         self._apply_items(f"Остаток {name}", [dict(i, title=i["path"]) for i in sel],
                           lambda it: leftover_delete(it, name), self._lo_after,
-                          f"Удалить остатки «{name}» ({len(sel)})?" + (f"\n⚠ Среди них «похожих»: {warn}" if warn else ""))
+                          f"Удалить остатки «{name}» ({len(sel)})?" + (f"\n⚠ Среди них сомнительных / «не трогать»: {warn}" if warn else ""))
 
     def _lo_after(self):
         if self.lo_app:
@@ -4168,7 +4476,8 @@ class App(QMainWindow):
         b2 = _btn("🧹 Исправить отмеченные", "danger", "Каждое удаление сохраняется в ↩ Откат", self._rc_fix)
         self.busy_btns.append(b2)
         cl.addLayout(_row(b1, b2, _btn("☑ Отметить всё", "", "", lambda: self._rc_check_all(True)),
-                          _btn("☐ Снять всё", "", "", lambda: self._rc_check_all(False))))
+                          _btn("☐ Снять всё", "", "", lambda: self._rc_check_all(False)),
+                          _btn("🙈 Исключения…", "", "Что никогда не показывать и не трогать", self._rc_ignore_dlg)))
         cl.addWidget(_lab("Отмечены только надёжные находки. ⚠ — файл на диске, который сейчас не подключён "
                           "(флешка, сетевой диск): не отмечается — подключите диск или включите переключатель выше. "
                           "Копия .reg не нужна: всё удалённое возвращает ↩ Откат.", "hint"))
@@ -4180,7 +4489,7 @@ class App(QMainWindow):
         self.cfg["rc_off"] = [k for k, t in self.rc_cats.items() if not t.isChecked()]
         if not cats:
             return log.warning("⚠ Отметьте хотя бы одну категорию")
-        self._scan_into("Чистка реестра", regclean_scan, "rc_items", self._rc_fill, cats)
+        self._scan_into("Чистка реестра", regclean_scan, "rc_items", self._rc_fill, cats, list(self.cfg.get("rc_ignore", [])))
 
     def _rc_fill(self):
         t = self.rc_tbl
@@ -4209,6 +4518,56 @@ class App(QMainWindow):
                 t.item(r, 0).setCheckState(Qt.Checked if self.rc_nodrive.isChecked() else Qt.Unchecked)
         t.blockSignals(False)
         self._rc_count()
+
+    def _rc_ignore_add(self, rows, field):
+        ign = self.cfg.setdefault("rc_ignore", [])
+        items = [self.rc_tbl.item(r, 0).data(Qt.UserRole) for r in rows]
+        for it in items:
+            v = it[field] if field == "key" else _sanitize(it["data"].split(": ", 1)[-1].split(" → ")[-1])
+            if v and v not in ign:
+                ign.append(v)
+        save_config(self.cfg)
+        self.rc_items = [i for i in self.rc_items if not rc_ignored(i, ign)]
+        self._rc_fill()
+        log.info(f"✓ В исключения добавлено: {len(items)} (🙈 Исключения… — посмотреть/убрать)")
+
+    def _rc_ignore_dlg(self):
+        from PySide6.QtWidgets import QDialog, QListWidget
+        d = QDialog(self)
+        d.setWindowTitle(f"{APP_NAME} — исключения чистки реестра")
+        d.resize(720, 420)
+        lay = QVBoxLayout(d)
+        lay.addWidget(_lab("Ключи и пути, которые чистка никогда не показывает. Папка исключает всё внутри неё.", "hint"))
+        lst = QListWidget()
+        lst.addItems(self.cfg.get("rc_ignore", []))
+        lst.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        lay.addWidget(lst, 1)
+        edit = QLineEdit()
+        edit.setMinimumWidth(420)
+        edit.setPlaceholderText("Добавить ключ (HKCU\\…) или путь (C:\\…, X:\\)…")
+
+        def add():
+            v = edit.text().strip()
+            if v:
+                lst.addItem(v)
+                edit.clear()
+
+        def remove():
+            for it in lst.selectedItems():
+                lst.takeItem(lst.row(it))
+
+        def save():
+            self.cfg["rc_ignore"] = [lst.item(i).text() for i in range(lst.count())]
+            save_config(self.cfg)
+            log.info(f"✓ Исключений: {lst.count()}")
+            d.accept()
+        lay.addLayout(_row(edit, _btn("➕ Добавить", "", "", add)))
+        lay.addLayout(_row(_btn("🗑 Убрать выбранные", "danger", "", remove), _btn("💾 Сохранить", "primary", "", save),
+                           _btn("Отмена", "", "", d.reject)))
+        lst.setContextMenuPolicy(Qt.CustomContextMenu)
+        lst.customContextMenuRequested.connect(lambda pos: _menu(d, [("🗑 Убрать", remove), ("📋 Копировать", lambda: _copy(
+            "\n".join(i.text() for i in lst.selectedItems())))]).exec(lst.viewport().mapToGlobal(pos)))
+        d.exec()
 
     def _rc_checked(self):
         t = self.rc_tbl
@@ -4263,7 +4622,9 @@ class App(QMainWindow):
         rows = self._sel_rows(self.rc_tbl)
         it = self.rc_tbl.item(rows[0], 0).data(Qt.UserRole) if rows else None
         acts = [("☑ Отметить выбранные", lambda: self._rc_set_sel(True)),
-                ("☐ Снять с выбранных", lambda: self._rc_set_sel(False)), None,
+                ("☐ Снять с выбранных", lambda: self._rc_set_sel(False)),
+                ("🙈 Никогда не трогать (ключ)", lambda: self._rc_ignore_add(rows, "key")),
+                ("🙈 Никогда не трогать (путь/данные)", lambda: self._rc_ignore_add(rows, "data")), None,
                 ("🔎 Открыть в regedit", lambda: it and open_regedit(f"{it['root']}\\{it['path']}"))]
         if it and it["cat"] in ("apppaths", "mui", "run", "installer", "firewall", "uninst", "shareddll"):
             acts.append(("📂 Показать файл", lambda: show_in_explorer(it["data"].split(" — ")[-1].split(": ", 1)[-1])))
