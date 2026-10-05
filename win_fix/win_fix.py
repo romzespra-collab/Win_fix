@@ -1,9 +1,17 @@
 r"""
-win_fix.py  v1.3.5
+win_fix.py  v1.4.0
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.4.0: ↩ Откат — каждое действие пишет старые значения (реестр, ключи целиком, файлы, ярлыки, задачи, DNS,
+        исключения Defender) в backup/undo_*.json, откат одной кнопкой; 🪄 «Исправить всё» (точка → курсор →
+        звуки → реестр ✗ → важные службы ✗); 📄 отчёт по всем проверкам (reports/*.txt); новые страницы:
+        ⚙ Службы (отключённые сборкой), 🧭 Браузеры (ярлыки с сайтом, политики стартовой/поиска/расширений),
+        📋 Меню Проводника (скрыть/показать/удалить пункты), 🏴 Активаторы (задачи, службы, файлы, IFEO,
+        KMS-сервер, исключения Defender), 🌐 Сеть (DNS-серверы, сброс DNS/Winsock/TCP-IP/WinHTTP);
+        оформление Windows: стандартная тема/обои, удаление OEM-сведений; проверки реестра: запреты обоев/темы/
+        экрана блокировки; 🔄 проверка обновлений на GitHub; страницы прокручиваются; вкладка запоминается по имени.
 v1.3.5: заблокированные кнопки выглядят заблокированными (и primary/danger), подсказка «недоступно: выполняется …»
         и строка «⏳ Выполняется» на странице 🛠; кнопка «⏹ Остановить» для DISM/SFC; ⏻ (нет в шрифтах) → 🔁.
 v1.3.4: курсор: подмена файлов определяется сверкой SHA256 с оригиналом из WinSxS, а не только по владельцу —
@@ -66,7 +74,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.3.5"
+VERSION = "1.4.0"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -130,7 +138,7 @@ from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication,
                                QButtonGroup, QFileDialog, QFrame, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
                                QMessageBox, QPlainTextEdit, QPushButton, QSplitter,
-                               QStackedWidget, QTableWidget, QTableWidgetItem,
+                               QScrollArea, QStackedWidget, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
 try:
@@ -393,11 +401,58 @@ def reg_get(root, path, name):
         return None
 
 
+# ── журнал отката: всё, что меняет действие Worker, пишется в backup/undo_*.json ──
+BACKUP_DIR = APP_ROOT / "backup"
+_JOURNAL = threading.local()  # .ops — список операций текущего действия (None — не пишем)
+
+
+def journal(op: dict) -> None:
+    ops = getattr(_JOURNAL, "ops", None)
+    if ops is not None:
+        ops.append(op)
+
+
+def _enc(v):
+    return {"b64": base64.b64encode(v).decode()} if isinstance(v, (bytes, bytearray)) else v
+
+
+def _dec(v):
+    return base64.b64decode(v["b64"]) if isinstance(v, dict) and "b64" in v else v
+
+
+def reg_get_raw(root, path, name):
+    """(значение, тип) или None."""
+    if not wr:
+        return None
+    try:
+        with wr.OpenKey(HK[root], path, 0, wr.KEY_READ | W64) as k:
+            return wr.QueryValueEx(k, name)
+    except OSError:
+        return None
+
+
+def _journal_reg(root, path, name):
+    if getattr(_JOURNAL, "ops", None) is None:
+        return
+    raw = reg_get_raw(root, path, name)
+    journal({"t": "reg", "root": root, "path": path, "name": name,
+             "old": None if raw is None else {"v": _enc(raw[0]), "type": raw[1]}})
+
+
+def journal_file(path) -> None:
+    """Запомнить содержимое файла до изменения."""
+    try:
+        journal({"t": "file", "path": str(path), "b64": base64.b64encode(Path(path).read_bytes()).decode()})
+    except OSError:
+        pass
+
+
 def reg_set(root, path, name, value, typ=None):
     _need_reg()
     if typ is None:
         typ = wr.REG_DWORD if isinstance(value, int) else wr.REG_BINARY if isinstance(value, bytes) else wr.REG_SZ
     old = reg_get(root, path, name)
+    _journal_reg(root, path, name)
     with wr.CreateKeyEx(HK[root], path, 0, wr.KEY_SET_VALUE | W64) as k:
         wr.SetValueEx(k, name, 0, typ, value)
     log.debug(f"REG SET {root}\\{path} [{name or '(по умолч.)'}]: {old!r} → {value!r}")
@@ -408,6 +463,8 @@ def reg_del(root, path, name) -> bool:
     try:
         with wr.OpenKey(HK[root], path, 0, wr.KEY_SET_VALUE | W64) as k:
             old = reg_get(root, path, name)
+            if old is not None:
+                _journal_reg(root, path, name)
             wr.DeleteValue(k, name)
         log.debug(f"REG DEL {root}\\{path} [{name}] (было {old!r})")
         return True
@@ -462,9 +519,25 @@ def reg_key_exists(root, path) -> bool:
         return False
 
 
+def reg_dump(root, path) -> dict:
+    """Ключ целиком (значения + подключи) — для отката удаления."""
+    return {"values": [[n, _enc(v), t] for n, v, t in reg_values(root, path)],
+            "keys": {k: reg_dump(root, rf"{path}\{k}") for k in reg_subkeys(root, path)}}
+
+
+def reg_restore_tree(root, path, dump) -> None:
+    with wr.CreateKeyEx(HK[root], path, 0, wr.KEY_SET_VALUE | W64) as k:
+        for n, v, t in dump["values"]:
+            wr.SetValueEx(k, n, 0, t, _dec(v))
+    for sub, d in dump["keys"].items():
+        reg_restore_tree(root, rf"{path}\{sub}", d)
+
+
 def reg_delete_tree(root, path) -> None:
     _need_reg()
     log.debug(f"REG DELTREE {root}\\{path}")
+    if getattr(_JOURNAL, "ops", None) is not None and reg_key_exists(root, path):
+        journal({"t": "tree", "root": root, "path": path, "dump": reg_dump(root, path)})
     ctypes.windll.advapi32.RegDeleteTreeW(HK[root], path)
     wr.DeleteKey(HK[root], path) if reg_key_exists(root, path) else None
 
@@ -855,14 +928,14 @@ def startup_scan():
 def startup_set_on(it: dict, on: bool):
     if it["kind"] == "task":
         verb = "Enable" if on else "Disable"
-        code, _o, err = run_ps(f"{verb}-ScheduledTask -TaskPath {ps_quote(it['tpath'])} -TaskName {ps_quote(it['name'])}")
+        tp, tn = ps_quote(it['tpath']), ps_quote(it['name'])
+        code, _o, err = run_ps(f"{verb}-ScheduledTask -TaskPath {tp} -TaskName {tn}")
         if code:
             raise RuntimeError(err.strip() or "нет прав (нужен администратор)")
+        journal({"t": "ps", "what": f"задача {it['name']}",
+                 "undo": f"{'Disable' if on else 'Enable'}-ScheduledTask -TaskPath {tp} -TaskName {tn}"})
     elif it["kind"] == "svc":
-        code, _o, err = run_ps(f"Set-Service -Name {ps_quote(it['svc'])} "
-                               f"-StartupType {'Automatic' if on else 'Disabled'} -ErrorAction Stop")
-        if code:
-            raise RuntimeError(err.strip() or "нет прав (нужен администратор)")
+        svc_start_set(it["svc"], 2 if on else 4)
     elif it.get("appr"):
         _approved_set(it["root"], it["appr"], it["name"], on)
     else:
@@ -892,13 +965,37 @@ def startup_delete(it: dict):
         dst = APP_ROOT / "removed_startup"
         dst.mkdir(exist_ok=True)
         target = _unique(dst / it["name"])
-        shutil.move(it["file"], target)  # между дисками os.replace не работает
+        move_journaled(it["file"], target)
         log.info(f"   файл перенесён: {target}")
     else:
-        code, _o, err = run_ps(f"Unregister-ScheduledTask -TaskPath {ps_quote(it['tpath'])} "
-                               f"-TaskName {ps_quote(it['name'])} -Confirm:$false")
-        if code:
-            raise RuntimeError(err.strip() or "нет прав")
+        task_delete(it["tpath"], it["name"])
+
+
+def move_journaled(src, dst) -> None:
+    shutil.move(str(src), str(dst))  # между дисками os.replace не работает
+    journal({"t": "move", "src": str(src), "dst": str(dst)})
+
+
+def task_delete(tpath, name) -> None:
+    """Удалить задачу Планировщика; XML сохраняется в журнал — откат пересоздаст её."""
+    tp, tn = ps_quote(tpath), ps_quote(name)
+    _c, xml, _e = run_ps(f"Export-ScheduledTask -TaskPath {tp} -TaskName {tn}")
+    code, _o, err = run_ps(f"Unregister-ScheduledTask -TaskPath {tp} -TaskName {tn} -Confirm:$false")
+    if code:
+        raise RuntimeError(err.strip() or "нет прав")
+    if xml.strip():
+        journal({"t": "ps", "what": f"задача {name}",
+                 "undo": f"Register-ScheduledTask -TaskPath {tp} -TaskName {tn} -Xml {ps_quote(xml)} -Force"})
+
+
+SVC_KEY = r"SYSTEM\CurrentControlSet\Services"
+
+
+def svc_start_set(name: str, start: int, delayed: int | None = None) -> None:
+    """Тип запуска службы через реестр (пишется в журнал отката). 2 авто, 3 вручную, 4 отключена."""
+    reg_set("HKLM", rf"{SVC_KEY}\{name}", "Start", int(start))
+    if delayed is not None:
+        reg_set("HKLM", rf"{SVC_KEY}\{name}", "DelayedAutostart", int(delayed))
 
 
 # ───────────────────────── проверки реестра ─────────────────────────
@@ -948,6 +1045,7 @@ def _hosts_lines():
 def _hosts_fix():
     """Чужие строки не стираются, а комментируются (# WinFix:) — их легко вернуть."""
     raw = HOSTS.read_bytes()
+    journal_file(HOSTS)
     bak = HOSTS.with_name("hosts.bak_winfix")
     bak.write_bytes(raw)
     txt = raw.decode("utf-8", "replace")
@@ -1029,6 +1127,17 @@ def build_checks():
                              "DisableRealtimeMonitoring")
     add("Политика: защита в реальном времени выкл.", "нет / 0", chk, fix, level="warn",
         key=r"HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection")
+    for root, path, name, title in [
+            ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop", "NoChangingWallPaper",
+             "Запрет смены обоев"),
+            ("HKCU", POL_EXP, "NoThemesTab", "Запрет смены темы"),
+            ("HKCU", POL_SYS, "Wallpaper", "Принудительные обои (политика)"),
+            ("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\Personalization", "LockScreenImage",
+             "Принудительный экран блокировки"),
+            ("HKLM", r"SOFTWARE\Policies\Microsoft\Windows\Personalization", "NoChangingLockScreen",
+             "Запрет смены экрана блокировки")]:
+        chk, fix = _policy_check(root, path, name)
+        add(title, "нет / 0", chk, fix, level="warn", key=f"{root}\\{path}")
     IS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
     add("Прокси (ProxyEnable)", "0",
         lambda: (reg_get("HKCU", IS, "ProxyEnable") in (None, 0),
@@ -1106,13 +1215,600 @@ def _explorer_running() -> bool:
     return "explorer.exe" in out.lower()
 
 
+# ───────────────────────── журнал отката ─────────────────────────
+def save_journal(title: str, ops) -> None:
+    if not ops:
+        return
+    try:
+        BACKUP_DIR.mkdir(exist_ok=True)
+        f = _unique(BACKUP_DIR / f"undo_{int(time.time() * 1000)}.json")  # мс — порядок даже в одну секунду
+        f.write_text(json.dumps({"title": title, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "ops": ops},
+                                ensure_ascii=False, indent=1), "utf-8")
+        log.debug(f"журнал отката: {f.name} ({len(ops)} изм.)")
+    except Exception:
+        log.warning("⚠ Журнал отката не сохранён", exc_info=True)
+
+
+def journal_list() -> list:
+    out = []
+    for f in sorted(BACKUP_DIR.glob("undo_*.json"), reverse=True) if BACKUP_DIR.is_dir() else []:
+        try:
+            d = json.loads(f.read_text("utf-8"))
+            out.append(dict(file=str(f), title=d.get("title", "?"), time=d.get("time", ""), n=len(d.get("ops", [])),
+                            done=bool(d.get("undone"))))
+        except Exception:
+            log.debug(f"битый журнал {f}", exc_info=True)
+    return out
+
+
+def journal_undo(path: str) -> None:
+    """Откатить одно действие: операции в обратном порядке. Сам откат в журнал не пишется."""
+    f = Path(path)
+    d = json.loads(f.read_text("utf-8"))
+    if d.get("undone"):
+        raise RuntimeError("уже откачено")
+    errors = 0
+    for op in reversed(d["ops"]):
+        try:
+            t = op["t"]
+            if t == "reg":
+                if op["old"] is None:
+                    reg_del(op["root"], op["path"], op["name"])
+                else:
+                    reg_set(op["root"], op["path"], op["name"], _dec(op["old"]["v"]), op["old"]["type"])
+            elif t == "tree":
+                reg_restore_tree(op["root"], op["path"], op["dump"])
+            elif t == "file":
+                Path(op["path"]).write_bytes(base64.b64decode(op["b64"]))
+            elif t == "move":
+                shutil.move(op["dst"], op["src"])
+            elif t == "ps":
+                code, _o, err = run_ps(op["undo"])
+                if code:
+                    raise RuntimeError(err.strip()[:200] or f"код {code}")
+            log.debug(f"откат: {op.get('t')} {op.get('path') or op.get('what') or ''}")
+        except Exception as e:
+            errors += 1
+            log.error(f"✗ откат {op.get('t')} {op.get('path') or op.get('what') or ''}: {e}")
+    d["undone"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    f.write_text(json.dumps(d, ensure_ascii=False, indent=1), "utf-8")
+    (log.warning if errors else log.info)(f"{'⚠' if errors else '✓'} Откачено: {d['title']} "
+                                          f"({len(d['ops']) - errors} из {len(d['ops'])})")
+
+
+# ───────────────────────── службы ─────────────────────────
+# имя: (название, запуск по умолчанию, отложенный, важная)
+SERVICES = {
+    "Audiosrv": ("Аудио Windows", 2, 0, True), "AudioEndpointBuilder": ("Построитель аудио", 2, 0, True),
+    "Themes": ("Темы", 2, 0, True), "WSearch": ("Поиск Windows", 2, 1, True), "Dnscache": ("DNS-клиент", 2, 0, True),
+    "Dhcp": ("DHCP-клиент", 2, 0, True), "NlaSvc": ("Сетевое расположение", 2, 0, True),
+    "netprofm": ("Список сетей", 3, 0, True), "Wcmsvc": ("Диспетчер подключений", 2, 0, True),
+    "WlanSvc": ("Wi-Fi", 2, 0, True), "LanmanWorkstation": ("Рабочая станция", 2, 0, True),
+    "mpssvc": ("Брандмауэр", 2, 0, True), "WinDefend": ("Антивирус Defender", 2, 0, True),
+    "wscsvc": ("Центр безопасности", 2, 1, True), "SecurityHealthService": ("Безопасность Windows", 3, 0, True),
+    "EventLog": ("Журнал событий", 2, 0, True), "Schedule": ("Планировщик заданий", 2, 0, True),
+    "CryptSvc": ("Криптография", 2, 0, True), "Winmgmt": ("WMI", 2, 0, True), "ProfSvc": ("Профили", 2, 0, True),
+    "EventSystem": ("События COM+", 2, 0, True), "PlugPlay": ("Plug and Play", 3, 0, True),
+    "Power": ("Питание", 2, 0, True), "Appinfo": ("Сведения о приложениях (UAC)", 3, 0, True),
+    "wuauserv": ("Центр обновления", 3, 0, True), "BITS": ("Фоновая передача (BITS)", 3, 0, True),
+    "UsoSvc": ("Оркестратор обновлений", 2, 1, False), "msiserver": ("Установщик Windows", 3, 0, True),
+    "TrustedInstaller": ("Установщик модулей", 3, 0, True), "VSS": ("Теневое копирование", 3, 0, True),
+    "Spooler": ("Печать", 2, 0, False), "bthserv": ("Bluetooth", 3, 0, False), "SysMain": ("SysMain", 2, 0, False),
+    "FontCache": ("Кэш шрифтов", 2, 0, False), "LanmanServer": ("Сервер (общие папки)", 2, 0, False),
+    "iphlpsvc": ("IP Helper", 2, 0, False), "WpnService": ("Уведомления", 2, 0, False),
+    "ShellHWDetection": ("Автозапуск носителей", 2, 0, False), "stisvc": ("Сканеры и камеры", 3, 0, False),
+    "WbioSrvc": ("Биометрия (Windows Hello)", 3, 0, False), "TabletInputService": ("Сенсорная клавиатура", 3, 0, False),
+    "W32Time": ("Служба времени", 3, 0, False), "WerSvc": ("Отчёты об ошибках", 3, 0, False),
+    "DiagTrack": ("Телеметрия", 2, 0, False), "DPS": ("Диагностика", 2, 0, False),
+    "seclogon": ("Вторичный вход", 3, 0, False), "RasMan": ("Удалённый доступ", 3, 0, False),
+    "AppXSvc": ("Магазин: развёртывание", 3, 0, False), "ClipSVC": ("Магазин: лицензии", 3, 0, False),
+    "InstallService": ("Магазин: установка", 3, 0, False), "wlidsvc": ("Учётная запись Microsoft", 3, 0, False),
+    "XblAuthManager": ("Xbox: вход", 3, 0, False), "SDRSVC": ("Архивация", 3, 0, False)}
+START_TXT = {0: "загрузка", 1: "система", 2: "авто", 3: "вручную", 4: "отключена"}
+
+
+def services_scan():
+    rows = []
+    for name, (title, dflt, delayed, important) in SERVICES.items():
+        if not reg_key_exists("HKLM", rf"{SVC_KEY}\{name}"):
+            continue
+        cur = reg_get("HKLM", rf"{SVC_KEY}\{name}", "Start")
+        if cur == 4 and dflt != 4:
+            st = "bad" if important else "warn"
+        else:
+            st = "ok"
+        rows.append(dict(name=name, title=title, cur=cur, dflt=dflt, delayed=delayed, important=important, st=st))
+    return rows
+
+
+def service_fix(r: dict) -> None:
+    svc_start_set(r["name"], r["dflt"], r["delayed"] if r["dflt"] == 2 else None)
+
+
+# ───────────────────────── браузеры и ярлыки ─────────────────────────
+BROWSER_EXE = re.compile(r"\\(chrome|msedge|firefox|opera|launcher|browser|iexplore|vivaldi|brave|yandex)\.exe$", re.I)
+URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+|\b[\w-]+\.(?:com|ru|net|org|info|xyz|top|club|online|site|pro|biz)"
+                    r"(?:/\S*)?\b")
+LNK_SCAN_PS = r"""
+$sh = New-Object -ComObject WScript.Shell
+$dirs = @([Environment]::GetFolderPath('Desktop'), "$env:PUBLIC\Desktop",
+  "$env:APPDATA\Microsoft\Windows\Start Menu", "$env:ProgramData\Microsoft\Windows\Start Menu",
+  "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch") | ?{ $_ -and (Test-Path $_) }
+@($dirs | %{ Get-ChildItem $_ -Recurse -Filter *.lnk -ErrorAction SilentlyContinue } | %{
+  $l = $sh.CreateShortcut($_.FullName); [pscustomobject]@{f=$_.FullName; t=$l.TargetPath; a=$l.Arguments} }) |
+  ConvertTo-Json -Compress
+"""
+POLICY_BROWSERS = [(r"SOFTWARE\Policies\Google\Chrome", "Chrome"), (r"SOFTWARE\Policies\Microsoft\Edge", "Edge"),
+                   (r"SOFTWARE\Policies\BraveSoftware\Brave", "Brave"), (r"SOFTWARE\Policies\YandexBrowser", "Яндекс"),
+                   (r"SOFTWARE\Policies\Mozilla\Firefox", "Firefox"), (r"SOFTWARE\Policies\Opera Software\Opera", "Opera")]
+POLICY_RED = re.compile(r"ExtensionInstallForcelist|ExtensionSettings|Extensions|DefaultSearch|SearchEngines|"
+                        r"Homepage|RestoreOnStartup|NewTabPage|Proxy", re.I)
+
+
+def lnk_clean_args(args: str) -> str:
+    return re.sub(r"\s{2,}", " ", URL_RE.sub("", args or "")).strip()
+
+
+def browsers_scan():
+    items = []
+    if IS_WIN:
+        _c, out, _ = run_ps(LNK_SCAN_PS, timeout=120)
+        try:
+            res = json.loads(out or "[]")
+            res = [res] if isinstance(res, dict) else res
+        except Exception:
+            res = []
+        for r in res:
+            if BROWSER_EXE.search(r.get("t") or "") and URL_RE.search(r.get("a") or ""):
+                items.append(dict(kind="lnk", src="Ярлык", name=Path(r["f"]).name, file=r["f"],
+                                  val=f"{r['t']} {r['a']}", st="bad"))
+    for root in ("HKCU", "HKLM"):
+        for base, br in POLICY_BROWSERS:
+            if not reg_key_exists(root, base):
+                continue
+            for n, v, _t in reg_values(root, base):
+                items.append(dict(kind="pol", src=f"{br} · политика {root}", name=n, root=root, path=base,
+                                  val=str(v), st="bad" if POLICY_RED.search(n) else "warn"))
+            for sub in reg_subkeys(root, base):
+                vals = "; ".join(str(v) for _n, v, _t in reg_values(root, rf"{base}\{sub}"))[:300]
+                items.append(dict(kind="polkey", src=f"{br} · политика {root}", name=sub + "\\", root=root,
+                                  path=rf"{base}\{sub}", val=vals or "(ключ)",
+                                  st="bad" if POLICY_RED.search(sub) else "warn"))
+    return items
+
+
+def browser_fix(it: dict) -> None:
+    if it["kind"] == "lnk":
+        journal_file(it["file"])
+        new = lnk_clean_args(it["val"].split(" ", 1)[1] if " " in it["val"] else "")
+        code, _o, err = run_ps(f"$s=New-Object -ComObject WScript.Shell;$l=$s.CreateShortcut({ps_quote(it['file'])});"
+                               f"$l.Arguments={ps_quote(new)};$l.Save()")
+        if code:
+            raise RuntimeError(err.strip() or "ярлык не сохранён")
+    elif it["kind"] == "pol":
+        reg_del(it["root"], it["path"], it["name"])
+    else:
+        reg_delete_tree(it["root"], it["path"])
+
+
+# ───────────────────────── контекстное меню Проводника ─────────────────────────
+CTX_SHELL = [r"*\shell", r"AllFilesystemObjects\shell", r"Directory\shell", r"Directory\Background\shell",
+             r"Folder\shell", r"Drive\shell", r"DesktopBackground\Shell"]
+CTX_EX = [r"*\shellex\ContextMenuHandlers", r"AllFilesystemObjects\shellex\ContextMenuHandlers",
+          r"Directory\shellex\ContextMenuHandlers", r"Directory\Background\shellex\ContextMenuHandlers",
+          r"Folder\shellex\ContextMenuHandlers", r"Drive\shellex\ContextMenuHandlers"]
+CTX_BUILTIN = {
+    "open", "opennew", "explore", "find", "runas", "cmd", "powershell", "print", "printto", "edit", "pintohome",
+    "pintostartscreen", "updateencryptionsettings", "updateencryptionsettingswork", "encrypt", "decrypt",
+    "opennewprocess", "opennewtab", "opennewwindow", "openinsandbox", "display", "personalize", "properties",
+    "sharing", "epp", "modernsharing", "open with", "open with encryptionmenu", "sendto", "workfolders",
+    "copyaspathmenu", "library location", "offline files", "new", "folderredirect", "{596ab062-b4d2-4215-9f74-e9109b0a8153}",
+    "{a2a9545d-a0c2-42b4-9708-a0b2badd77c8}", "{90aa3a4e-1cba-4233-b8bb-535773d48449}", "{e2bf9676-5f8f-435c-97eb-11607a5bedf7}",
+    "{09a47860-11b0-4da5-afa5-26d86198a780}", "{7ad84985-87b4-4a16-be58-8b72a5b390f7}", "{b8cdcb65-b1bf-4b42-9428-1dfdb7ee92af}",
+    "{f81e9010-6ea4-11ce-a7ff-00aa003ca9f6}", "{d969a300-e7ff-11d0-a93b-00a0c91e2ca2}", "{474c98ee-cf3d-41f5-80e3-4aab0ab04301}",
+    "{5250e46f-bb09-d602-5891-f476dc89b700}", "{e82a2d71-5b2f-43a0-97b8-81be15854de8}", "{fbeb8a05-beee-4442-804e-409d6c4515e9}"}
+BLOCKED = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Blocked"
+GUID_RE = re.compile(r"^\{[0-9a-f-]{36}\}$", re.I)
+
+
+def _clsid_dll(clsid: str) -> str:
+    return str(reg_get("HKCR", rf"CLSID\{clsid}\InprocServer32", "") or reg_get("HKCR", rf"CLSID\{clsid}", "") or "")
+
+
+def ctx_scan(show_builtin=False):
+    items = []
+    for base in CTX_SHELL:
+        for verb in reg_subkeys("HKCR", base):
+            if not show_builtin and verb.lower() in CTX_BUILTIN:
+                continue
+            key = rf"{base}\{verb}"
+            title = reg_get("HKCR", key, "MUIVerb") or reg_get("HKCR", key, "") or verb
+            cmd = reg_get("HKCR", key + r"\command", "") or ("(подменю)" if reg_get("HKCR", key, "SubCommands") is not None
+                                                              or reg_key_exists("HKCR", key + r"\shell") else "")
+            items.append(dict(kind="verb", where=base.split("\\")[0], name=verb, title=str(title), cmd=str(cmd),
+                              path=key, on=reg_get("HKCR", key, "LegacyDisable") is None,
+                              builtin=verb.lower() in CTX_BUILTIN))
+    for base in CTX_EX:
+        for h in reg_subkeys("HKCR", base):
+            key = rf"{base}\{h}"
+            clsid = h if GUID_RE.match(h) else str(reg_get("HKCR", key, "") or "")
+            builtin = h.lower() in CTX_BUILTIN or clsid.lower() in CTX_BUILTIN
+            if (not show_builtin and builtin) or not clsid:
+                continue
+            blocked = reg_get("HKLM", BLOCKED, clsid) is not None or reg_get("HKCU", BLOCKED, clsid) is not None
+            items.append(dict(kind="ex", where=base.split("\\")[0], name=h, title=h, cmd=_clsid_dll(clsid),
+                              clsid=clsid, path=key, on=not blocked, builtin=builtin))
+    return items
+
+
+def ctx_set_on(it: dict, on: bool) -> None:
+    if it["kind"] == "verb":
+        if on:
+            reg_del("HKCR", it["path"], "LegacyDisable")
+        else:
+            reg_set("HKCR", it["path"], "LegacyDisable", "")
+    else:
+        if on:
+            reg_del("HKLM", BLOCKED, it["clsid"])
+            reg_del("HKCU", BLOCKED, it["clsid"])
+        else:
+            try:
+                reg_set("HKLM", BLOCKED, it["clsid"], it["name"])
+            except PermissionError:
+                reg_set("HKCU", BLOCKED, it["clsid"], it["name"])
+    it["on"] = on
+
+
+# ───────────────────────── следы активаторов (KMS) ─────────────────────────
+KMS_RE = r"kms|aact|autopico|kmspico|kms_?vl|kmseldi|secoh|ratiborus|w10digital|hwidgen|massgrave|activat"
+KMS_PS = r"""
+$re = '__RE__'
+$o = @()
+Get-ScheduledTask -ErrorAction SilentlyContinue | ?{ $_.TaskPath -notlike '\Microsoft\*' -and
+  (($_.TaskName + ' ' + (($_.Actions | %{ $_.Execute + ' ' + $_.Arguments }) -join ' ')) -match $re) } |
+  %{ $o += [pscustomobject]@{k='task'; n=$_.TaskName; p=$_.TaskPath;
+     v=(($_.Actions | %{ $_.Execute + ' ' + $_.Arguments }) -join ' ; ')} }
+Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ?{ ($_.Name + ' ' + $_.DisplayName + ' ' + $_.PathName) -match $re -and
+  $_.PathName -notmatch 'sppsvc|svchost' } | %{ $o += [pscustomobject]@{k='svc'; n=$_.Name; p=''; v=$_.PathName} }
+@("$env:SystemRoot\SECOH-QAD.exe", "$env:SystemRoot\SECOH-QAD.dll", "$env:SystemRoot\System32\SppExtComObjHook.dll",
+  "$env:SystemRoot\System32\SppExtComObjPatcher.exe", "$env:SystemRoot\AAct_Tools", "$env:SystemRoot\KMSAutoS",
+  "$env:ProgramData\KMSAutoS", "$env:ProgramData\KMSAuto", "$env:ProgramData\KMSAuto Net",
+  "$env:ProgramFiles\KMSpico", "${env:ProgramFiles(x86)}\KMSpico", "$env:ProgramData\Microsoft\AAct") |
+  ?{ $_ -and (Test-Path $_) } | %{ $o += [pscustomobject]@{k='file'; n=(Split-Path $_ -Leaf); p=$_; v=$_} }
+try { (Get-MpPreference -ErrorAction Stop).ExclusionPath | ?{ $_ } |
+  %{ $o += [pscustomobject]@{k='mpex'; n=$_; p=''; v=$_} } } catch {}
+@($o) | ConvertTo-Json -Compress
+"""
+SPP = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform"
+OSPP = r"SOFTWARE\Microsoft\OfficeSoftwareProtectionPlatform"
+
+
+def kms_scan():
+    items = []
+    if IS_WIN:
+        _c, out, _ = run_ps(KMS_PS.replace("__RE__", KMS_RE), timeout=180)
+        try:
+            res = json.loads(out or "[]")
+            res = [res] if isinstance(res, dict) else res
+        except Exception:
+            res = []
+        kre = re.compile(KMS_RE, re.I)
+        for r in res:
+            k = r["k"]
+            if k == "mpex":
+                bad = bool(kre.search(r["n"])) or bool(re.match(r"(?i)^[a-z]:\\?$|^%?systemroot%?|.*\\windows\\?$", r["n"]))
+                items.append(dict(kind="mpex", src="Исключение Defender", name=r["n"], val=r["v"],
+                                  st="bad" if bad else "warn"))
+            else:
+                items.append(dict(kind=k, src={"task": "Задача", "svc": "Служба", "file": "Файл/папка"}[k],
+                                  name=r["n"], path=r.get("p") or "", val=r.get("v") or "", st="bad"))
+    for exe in ("SppExtComObj.exe", "sppsvc.exe", "osppsvc.exe"):
+        for val in ("Debugger", "VerifierDlls"):
+            v = reg_get("HKLM", rf"{IFEO}\{exe}", val)
+            if v:
+                items.append(dict(kind="reg", src="IFEO (перехват активации)", name=f"{exe} → {val}", root="HKLM",
+                                  path=rf"{IFEO}\{exe}", rname=val, val=str(v), st="bad"))
+    for key, title in ((SPP, "KMS-сервер Windows"), (OSPP, "KMS-сервер Office")):
+        v = reg_get("HKLM", key, "KeyManagementServiceName")
+        if v:
+            local = bool(re.match(r"^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|localhost)", str(v)))
+            items.append(dict(kind="reg", src=title, name="KeyManagementServiceName", root="HKLM", path=key,
+                              rname="KeyManagementServiceName", val=str(v), st="bad" if local else "warn"))
+    return items
+
+
+def kms_delete(it: dict) -> None:
+    k = it["kind"]
+    if k == "task":
+        task_delete(it["path"], it["name"])
+    elif k == "svc":
+        run_ps(f"Stop-Service -Name {ps_quote(it['name'])} -Force -ErrorAction SilentlyContinue")
+        svc_start_set(it["name"], 4)  # сначала отключаем (откатывается), затем удаляем
+        code, out, err = run_cmd(["sc", "delete", it["name"]])
+        if code:
+            raise RuntimeError((out or err).strip() or "служба не удалена")
+        log.warning(f"⚠ Служба {it['name']} удалена — откат вернёт только тип запуска")
+    elif k == "file":
+        dst = BACKUP_DIR / "kms"
+        dst.mkdir(parents=True, exist_ok=True)
+        move_journaled(it["path"], _unique(dst / Path(it["path"]).name))
+    elif k == "mpex":
+        code, _o, err = run_ps(f"Remove-MpPreference -ExclusionPath {ps_quote(it['name'])} -ErrorAction Stop")
+        if code:
+            raise RuntimeError(err.strip() or "нет прав")
+        journal({"t": "ps", "what": f"исключение {it['name']}",
+                 "undo": f"Add-MpPreference -ExclusionPath {ps_quote(it['name'])}"})
+    elif k == "reg":
+        reg_del(it["root"], it["path"], it["rname"])
+
+
+# ───────────────────────── сеть ─────────────────────────
+DNS_KNOWN = {"1.1.1.1": "Cloudflare", "1.0.0.1": "Cloudflare", "8.8.8.8": "Google", "8.8.4.4": "Google",
+             "9.9.9.9": "Quad9", "149.112.112.112": "Quad9", "77.88.8.8": "Яндекс", "77.88.8.1": "Яндекс",
+             "77.88.8.88": "Яндекс", "77.88.8.2": "Яндекс", "208.67.222.222": "OpenDNS", "208.67.220.220": "OpenDNS",
+             "94.140.14.14": "AdGuard", "94.140.15.15": "AdGuard", "76.76.2.0": "ControlD", "76.76.10.0": "ControlD"}
+PRIVATE_RE = re.compile(r"^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|169\.254\.|fe80:|fec0:|::1|fd)", re.I)
+
+
+def dns_scan():
+    if not IS_WIN:
+        return []
+    _c, out, _ = run_ps("@(Get-DnsClientServerAddress -AddressFamily IPv4 | ?{ $_.ServerAddresses } | "
+                        "%{[pscustomobject]@{i=$_.InterfaceIndex; a=$_.InterfaceAlias; s=@($_.ServerAddresses)}}) "
+                        "| ConvertTo-Json -Compress -Depth 3")
+    try:
+        res = json.loads(out or "[]")
+        res = [res] if isinstance(res, dict) else res
+    except Exception:
+        return []
+    rows = []
+    for r in res:
+        srv = r["s"] if isinstance(r["s"], list) else [r["s"]]
+        notes = [DNS_KNOWN.get(x) or ("локальный/роутер" if PRIVATE_RE.match(x) else "⚠ неизвестный") for x in srv]
+        rows.append(dict(idx=r["i"], alias=r["a"], servers=srv, note=", ".join(notes),
+                         st="warn" if any(n.startswith("⚠") for n in notes) else "ok"))
+    return rows
+
+
+def dns_reset(row: dict) -> None:
+    code, _o, err = run_ps(f"Set-DnsClientServerAddress -InterfaceIndex {int(row['idx'])} -ResetServerAddresses")
+    if code:
+        raise RuntimeError(err.strip() or "нет прав")
+    journal({"t": "ps", "what": f"DNS {row['alias']}",
+             "undo": f"Set-DnsClientServerAddress -InterfaceIndex {int(row['idx'])} -ServerAddresses "
+                     f"@({','.join(ps_quote(x) for x in row['servers'])})"})
+
+
+NET_CMDS = {"flushdns": (["ipconfig", "/flushdns"], "Кэш DNS очищен"),
+            "winsock": (["netsh", "winsock", "reset"], "Winsock сброшен (нужна перезагрузка)"),
+            "tcpip": (["netsh", "int", "ip", "reset"], "TCP/IP сброшен (нужна перезагрузка)"),
+            "winhttp": (["netsh", "winhttp", "reset", "proxy"], "Прокси WinHTTP сброшен")}
+
+
+def net_cmd(key: str) -> None:
+    args, ok = NET_CMDS[key]
+    code, out, err = run_cmd(args)
+    if code:
+        raise RuntimeError((out or err).strip()[:300] or f"код {code}")
+    log.info(f"✓ {ok}")
+
+
+# ───────────────────────── оформление Windows ─────────────────────────
+OEM_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation"
+OEM_VALUES = ("Manufacturer", "Model", "Logo", "SupportURL", "SupportPhone", "SupportHours", "HelpCustomized")
+WALLPAPER = Path(WINDIR) / r"Web\Wallpaper\Windows\img0.jpg"
+THEME_FILE = Path(WINDIR) / r"Resources\Themes\aero.theme"
+
+
+def oem_info() -> dict:
+    return {n: reg_get("HKLM", OEM_KEY, n) for n in OEM_VALUES if reg_get("HKLM", OEM_KEY, n) not in (None, "")}
+
+
+def oem_clear() -> None:
+    for n in OEM_VALUES:
+        reg_del("HKLM", OEM_KEY, n)
+
+
+def wallpaper_default() -> None:
+    _need_reg()
+    reg_set("HKCU", r"Control Panel\Desktop", "Wallpaper", str(WALLPAPER))
+    ctypes.windll.user32.SystemParametersInfoW(0x0014, 0, str(WALLPAPER), 3)  # SPI_SETDESKWALLPAPER
+
+
+# ───────────────────────── проверка обновлений ─────────────────────────
+UPDATE_REPO = "romzespra-collab/Win_fix"
+
+
+def _ver(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def update_check():
+    """→ (последняя версия, url) или None, если релизов нет/нет доступа."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+                                 headers={"User-Agent": f"{APP_NAME}/{VERSION}", "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise RuntimeError(f"GitHub ответил {e.code}")
+    return d.get("tag_name", ""), d.get("html_url") or f"https://github.com/{UPDATE_REPO}/releases"
+
+
+# ───────────────────────── отчёт ─────────────────────────
+REPORT_DIR = APP_ROOT / "reports"
+_MARK = {"ok": "✓", "warn": "⚠", "bad": "✗"}
+
+
+def build_report(checks) -> Path:
+    import platform
+    L = [f"{APP_NAME} v{VERSION} — отчёт", time.strftime("%Y-%m-%d %H:%M:%S"),
+         f"{platform.platform()} · администратор: {'да' if is_admin() else 'нет'}", "=" * 70]
+
+    def sec(title):
+        L.extend(["", title, "-" * len(title)])
+
+    def safe(title, fn):
+        try:
+            fn()
+        except Exception as e:
+            L.append(f"  ✗ раздел «{title}» не собран: {e}")
+
+    def cur():
+        sec("КУРСОР")
+        bad, owner = cursor_files_check()
+        scheme, rows, custom = cursor_scan(bad_names(bad))
+        L.append(f"  схема: {scheme}; авторских схем: {len(custom)}; подменённых файлов: {len(bad)}")
+        L.extend(f"  {_MARK[st]} {t}: {f}" for t, f, st, _r in rows)
+        L.extend(f"  ✗ подменён файл: {x}" for x in bad)
+
+    def snd():
+        sec("ЗВУКИ")
+        rows, start_on = sound_scan()
+        L.append(f"  мелодия запуска: {'вкл' if start_on else 'выкл'}")
+        L.extend(f"  {_MARK[st]} {t}: {c}" for t, c, _d, st, _e in rows)
+
+    def regc():
+        sec("РЕЕСТР")
+        for ch in checks:
+            try:
+                ok, cur_ = ch["check"]()
+            except Exception as e:
+                ok, cur_ = False, f"ошибка: {e}"
+            L.append(f"  {_MARK['ok' if ok else ch['level']]} {ch['title']}: {cur_}")
+
+    def svc():
+        sec("СЛУЖБЫ (отключённые)")
+        rows = [r for r in services_scan() if r["st"] != "ok"]
+        L.extend(f"  {_MARK[r['st']]} {r['title']} ({r['name']}): {START_TXT.get(r['cur'], r['cur'])}, "
+                 f"норма — {START_TXT[r['dflt']]}" for r in rows)
+        if not rows:
+            L.append("  ✓ всё в норме")
+
+    def st():
+        sec("АВТОЗАГРУЗКА")
+        items = startup_scan()
+        L.append(f"  записей: {len(items)}")
+        L.extend(f"  🎵 {i['src']} · {i['name']}: {i['cmd']}" for i in items if i["music"])
+        L.extend(f"  · {i['src']} · {i['name']} [{'вкл' if i['on'] else 'выкл'}]: {i['cmd'][:150]}" for i in items
+                 if not i["music"])
+
+    def br():
+        sec("БРАУЗЕРЫ И ЯРЛЫКИ")
+        items = browsers_scan()
+        L.extend(f"  {_MARK[i['st']]} {i['src']} · {i['name']}: {i['val'][:200]}" for i in items)
+        if not items:
+            L.append("  ✓ подмен не найдено")
+
+    def ctx():
+        sec("МЕНЮ ПРОВОДНИКА (сторонние пункты)")
+        items = ctx_scan()
+        L.extend(f"  {'·' if i['on'] else '⏸'} {i['where']} · {i['title']}: {i['cmd'][:150]}" for i in items)
+        if not items:
+            L.append("  ✓ сторонних пунктов нет")
+
+    def kms():
+        sec("СЛЕДЫ АКТИВАТОРОВ")
+        items = kms_scan()
+        L.extend(f"  {_MARK[i['st']]} {i['src']} · {i['name']}: {i['val'][:200]}" for i in items)
+        if not items:
+            L.append("  ✓ не найдено")
+
+    def net():
+        sec("СЕТЬ")
+        L.extend(f"  {_MARK[r['st']]} {r['alias']}: {', '.join(r['servers'])} ({r['note']})" for r in dns_scan())
+        rows = ports_scan()
+        risky = sorted({(r["port"], r["name"]) for r in rows if r["listen"] and r["port"] in RISKY
+                        and not r["addr"].startswith(("127.", "[::1]"))})
+        L.extend(f"  ⚠ открыт порт {p} {RISKY[p]} ({n})" for p, n in risky)
+
+    def oem():
+        sec("OEM-СВЕДЕНИЯ")
+        info = oem_info()
+        L.extend(f"  ⚠ {k}: {v}" for k, v in info.items())
+        if not info:
+            L.append("  ✓ пусто")
+
+    for title, fn in (("курсор", cur), ("звуки", snd), ("реестр", regc), ("службы", svc), ("автозагрузка", st),
+                      ("браузеры", br), ("меню", ctx), ("активаторы", kms), ("сеть", net), ("OEM", oem)):
+        log.info(f"   отчёт: {title}…")
+        safe(title, fn)
+    REPORT_DIR.mkdir(exist_ok=True)
+    f = REPORT_DIR / f"winfix_report_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+    f.write_text("\r\n".join(L) + "\r\n", "utf-8-sig")
+    return f
+
+
+# ───────────────────────── мастер «исправить всё» ─────────────────────────
+def fix_all(checks) -> None:
+    """Точка восстановления → курсор → звуки → реестр (✗) → важные службы (✗). Один журнал — один откат.
+    Ошибка одного шага не останавливает остальные."""
+    def restore_point():
+        if not is_admin():
+            return log.warning("⚠ Без прав администратора — точка пропущена, HKLM не исправится")
+        _c, out, err = run_ps(RESTORE_POINT_PS, 300)
+        if "RP_OK" in out:
+            log.info("✓ Точка восстановления создана")
+        else:
+            log.warning(f"⚠ Точка не создана: {(out.replace('RP_WARN', '').strip() or err.strip())[:200]}")
+
+    def cursor():
+        cursor_reset()
+        log.info("✓ Курсор стандартный")
+
+    def sounds():
+        log.info(f"✓ Звуки: изменено событий {sound_reset_all()}")
+
+    def registry():
+        n = 0
+        for ch in checks:
+            try:
+                ok, _cur = ch["check"]()
+                if not ok and ch["level"] == "bad":
+                    ch["fix"]()
+                    n += 1
+                    log.info(f"✓ Исправлено: {ch['title']}")
+            except Exception as e:
+                log.error(f"✗ {ch['title']}: {e}")
+        log.info(f"✓ Реестр: исправлено {n}")
+
+    def services():
+        n = 0
+        for r in services_scan():
+            if r["st"] == "bad":
+                try:
+                    service_fix(r)
+                    n += 1
+                    log.info(f"✓ Служба {r['title']}: {START_TXT[r['dflt']]}")
+                except Exception as e:
+                    log.error(f"✗ Служба {r['title']}: {e}")
+        log.info(f"✓ Службы: исправлено {n}")
+
+    steps = (("Точка восстановления", restore_point), ("Курсор", cursor), ("Звуки", sounds),
+             ("Реестр (только ✗)", registry), ("Важные службы", services))
+    for i, (title, fn) in enumerate(steps, 1):
+        log.info(f"⏳ {i}/{len(steps)} {title}…")
+        try:
+            fn()
+        except PermissionError:
+            log.error(f"✗ {title}: нет прав — запустите от администратора")
+        except Exception as e:
+            log.error(f"✗ {title}: {e}", exc_info=True)
+    log.info("✅ Готово. Откатить всё разом — страница ↩ Откат. Часть изменений — после перезагрузки.")
+
+
 # ───────────────────────── Worker ─────────────────────────
 class Worker:
     def __init__(self):
         self.busy = False
 
-    def run(self, title: str, fn, *args, then=None):
-        """then — вызвать в UI-потоке ПОСЛЕ освобождения (можно запускать следующее действие)."""
+    def run(self, title: str, fn, *args, then=None, journal=True):
+        """then — вызвать в UI-потоке ПОСЛЕ освобождения (можно запускать следующее действие).
+        journal — писать изменения в backup/undo_*.json (для «↩ Откат»)."""
         if self.busy:
             log.warning("⚠ Подождите — выполняется другое действие")
             return False
@@ -1122,6 +1818,7 @@ class Worker:
         def body():
             t0 = time.time()
             log.debug(f"▶ начало: {title}")
+            _JOURNAL.ops = [] if journal else None
             try:
                 fn(*args)
             except PermissionError:
@@ -1131,6 +1828,8 @@ class Worker:
             except Exception as e:
                 log.error(f"✗ {title}: {e}", exc_info=True)
             finally:
+                save_journal(title, _JOURNAL.ops)
+                _JOURNAL.ops = None
                 log.debug(f"■ конец: {title} ({time.time() - t0:.1f} с)")
                 self.busy = False
                 LOGQ.put(_DONE_SENTINEL)
@@ -1190,7 +1889,7 @@ def _qss(p: dict) -> str:
     QComboBox:focus, QSpinBox:focus {{ border-color: {p['accent']}; }}
     QComboBox QAbstractItemView {{ background: {p['panel']}; border: 1px solid {p['line']}; }}
     QCheckBox, QRadioButton {{ background: transparent; }}
-    QWidget#page {{ background: {p['bg']}; }}
+    QWidget#page, QScrollArea#pagescroll {{ background: {p['bg']}; border: none; }}
     #side {{ background: {p['side']}; border-right: 1px solid {p['line']}; }}
     #side QPushButton#nav {{ border: none; border-radius: 9px; background: transparent; text-align: left;
                              padding: 9px 12px; font-size: 10pt; color: {p['muted']}; }}
@@ -1421,7 +2120,10 @@ def _copy(text):
 class App(QMainWindow):
     PAGES = [("🖱", "Курсор", "Курсор"), ("🔊", "Звуки", "Звуки входа"),
              ("🚀", "Автозагрузка", "Автозагрузка (музыка при входе)"), ("🩺", "Реестр", "Проверка реестра"),
-             ("🌐", "Порты", "Порты"), ("🛠", "Система", "Система и инструменты"), ("🎨", "Цвета", "Цвета")]
+             ("⚙", "Службы", "Службы Windows"), ("🧭", "Браузеры", "Браузеры и ярлыки"),
+             ("📋", "Меню", "Контекстное меню Проводника"), ("🏴", "Активаторы", "Следы активаторов"),
+             ("🌐", "Сеть", "Сеть и DNS"), ("🔌", "Порты", "Порты"), ("🛠", "Система", "Система и инструменты"),
+             ("↩", "Откат", "Откат изменений"), ("🎨", "Цвета", "Цвета и программа")]
     SIDE_W, SIDE_MIN = 196, 62
 
     def __init__(self):
@@ -1474,13 +2176,14 @@ class App(QMainWindow):
         self.nav_btns = []
         self.stack = QStackedWidget()
         builders = [self._page_cursor, self._page_sound, self._page_startup, self._page_registry,
-                    self._page_ports, self._page_system, self._page_theme]
+                    self._page_services, self._page_browsers, self._page_ctx, self._page_kms, self._page_net,
+                    self._page_ports, self._page_system, self._page_undo, self._page_theme]
         for i, ((emo, short, tip), build) in enumerate(zip(self.PAGES, builders)):
             b = QPushButton()
             b.setObjectName("nav")
             b.setToolTip(tip)
             b.setCheckable(True)
-            b.setFixedHeight(40)
+            b.setFixedHeight(36)
             b.setCursor(Qt.PointingHandCursor)
             b.setContextMenuPolicy(Qt.CustomContextMenu)
             b.customContextMenuRequested.connect(lambda pos, bb=b: self._side_menu(bb.mapToGlobal(pos)))
@@ -1496,7 +2199,13 @@ class App(QMainWindow):
             pl.setSpacing(12)
             pl.addWidget(_lab(f"{emo}  {tip}", "big"))
             build(pl)
-            self.stack.addWidget(page)
+            sc = QScrollArea()  # маленький экран — страница прокручивается, а не сжимается
+            sc.setObjectName("pagescroll")
+            sc.setWidgetResizable(True)
+            sc.setFrameShape(QFrame.NoFrame)
+            sc.setWidget(page)
+            page.setMinimumHeight(420)
+            self.stack.addWidget(sc)
         self.nav.idClicked.connect(self._go)
         side.setContextMenuPolicy(Qt.CustomContextMenu)
         side.customContextMenuRequested.connect(lambda pos: self._side_menu(side.mapToGlobal(pos)))
@@ -1545,7 +2254,8 @@ class App(QMainWindow):
                 self.split.restoreState(QByteArray.fromBase64(self.cfg["splitter"].encode()))
         except Exception:
             pass
-        self._go(int(self.cfg.get("page", 0)) % len(self.PAGES))
+        names = [x[1] for x in self.PAGES]  # вкладка по имени: номера меняются между версиями
+        self._go(names.index(self.cfg["page_name"]) if self.cfg.get("page_name") in names else 0)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._drain_log)
         self.timer.start(150)
@@ -1561,6 +2271,9 @@ class App(QMainWindow):
         self.nav.button(i).setChecked(True)
         self.stack.setCurrentIndex(i)
         self.cfg["page"] = i
+        self.cfg["page_name"] = self.PAGES[i][1]
+        if self.PAGES[i][1] == "Откат":
+            self.undo_refresh()
 
     def _set_side(self, collapsed: bool):
         self.cfg["side_collapsed"] = collapsed
@@ -1765,7 +2478,7 @@ class App(QMainWindow):
                 cursor_size_set(n)
             finally:
                 ui(self._cur_size_sync)
-        self.worker.run("размер курсора", job)
+        self.worker.run("размер курсора", job, journal=False)
 
     def _cur_size_sync(self):
         if not self._size_timer.isActive():  # пока пользователь щёлкает — не мешаем
@@ -2191,6 +2904,16 @@ class App(QMainWindow):
 
     # ── 🛠 система ──
     def _page_system(self, pl):
+        c, cl = _card("Быстро")
+        b0 = _btn("🪄 Исправить всё", "primary", "Точка восстановления → курсор → звуки → реестр ✗ → службы ✗",
+                  self.fix_all)
+        b9 = _btn("📄 Отчёт", "", "Все проверки в один файл reports\\*.txt — удобно прислать", self.make_report)
+        self.busy_btns += [b0, b9]
+        cl.addLayout(_row(b0, b9, _btn("↩ Откат", "", "Журнал изменений", lambda: self._go([x[1] for x in self.PAGES].index("Откат")))))
+        cl.addWidget(_lab("«Исправить всё» — безопасный набор: только явные поломки (✗), одна запись для отката.",
+                          "hint"))
+        pl.addWidget(c)
+
         c, cl = _card("Проверка системных файлов")
         b1 = _btn("⚡ DISM + SFC", "primary", "Сначала восстановить хранилище, затем проверить файлы (20–40 мин)",
                   lambda: self.sys_scan(True, True))
@@ -2213,6 +2936,19 @@ class App(QMainWindow):
         self.busy_btns.append(b4)
         cl.addLayout(_row(b4, _btn("🔄 Перезапустить Проводник", "", "", self.sys_explorer),
                           _btn("🔁 Перезагрузка", "danger", "Перезагрузить компьютер через 10 с", self.sys_reboot)))
+        pl.addWidget(c)
+
+        c, cl = _card("Оформление Windows")
+        cl.addLayout(_row(_btn("🎨 Стандартная тема", "", str(THEME_FILE), self._theme_default),
+                          _btn("🏞 Стандартные обои", "", str(WALLPAPER), self._wallpaper),
+                          _btn("🏷 Убрать OEM-сведения", "danger", "Логотип/телефон/сайт сборки в «О системе»",
+                               self._oem_clear),
+                          _btn("⚙ Персонализация", "chip", "ms-settings:personalization",
+                               lambda: shell_open("ms-settings:personalization"))))
+        self.oem_lbl = _lab("", "hint")
+        cl.addWidget(self.oem_lbl)
+        self._oem_show()
+        cl.addWidget(_lab("Запреты смены обоев/темы/экрана блокировки — 🩺 Реестр.", "hint"))
         pl.addWidget(c)
 
         c, cl = _card("Панели Windows")
@@ -2295,6 +3031,414 @@ class App(QMainWindow):
             shell_open("powershell.exe", '-NoExit -NoProfile -ExecutionPolicy Bypass -Command "irm christitus.com/win | iex"',
                        admin=True)
 
+    # ── общий шаблон «таблица + сканирование» ──
+    def _scan_into(self, title, scan_fn, attr, fill, *args):
+        """Сканирование в фоне → self.<attr> → fill() в UI-потоке."""
+        def job():
+            items = scan_fn(*args)
+            bad = sum(1 for i in items if i.get("st") == "bad")
+            log.info(f"{'⚠' if bad else '✓'} {title}: {len(items)}" + (f", ✗ {bad}" if bad else ""))
+            ui(lambda: (setattr(self, attr, items), fill()))
+        self.worker.run(title, job, journal=False)
+
+    def _apply_items(self, title, items, fn, done=None, ask=None):
+        """fn(item) для выбранных; ошибки по одной строке; потом done() в UI."""
+        if not items:
+            return log.warning("⚠ Выберите строки")
+        if ask and not self._ask(ask + "\n\n" + "\n".join(str(i.get("title") or i.get("name")) for i in items[:15])
+                                 + ("\n…" if len(items) > 15 else "")):
+            return
+
+        def job():
+            for it in items:
+                try:
+                    fn(it)
+                    log.info(f"✓ {title}: {it.get('title') or it.get('name')}")
+                except Exception as e:
+                    log.error(f"✗ {it.get('title') or it.get('name')}: {e}", exc_info=True)
+        self.worker.run(title, job, then=done)
+
+    def _sel_data(self, t: QTableWidget):
+        return [t.item(r, 0).data(Qt.UserRole) for r in self._sel_rows(t) if t.item(r, 0)]
+
+    def _scan_btn(self, text, tip, slot):
+        b = _btn(text, "primary", tip, slot)
+        self.busy_btns.append(b)
+        return b
+
+    def _std_menu(self, t: QTableWidget, pos, acts):
+        rows = self._sel_rows(t)
+        acts = acts + [None, ("📋 Копировать строку", lambda: _copy(_table_text(t, rows))),
+                       ("📋 Копировать всё", lambda: _copy(_table_text(t)))]
+        _menu(self, acts).exec(t.viewport().mapToGlobal(pos))
+
+    # ── ⚙ службы ──
+    def _page_services(self, pl):
+        c, cl = _card("Службы Windows, которые сборки отключают")
+        self.sv_all = Toggle("Показать все (не только отключённые)")
+        self.sv_all.clicked.connect(self._sv_fill)
+        cl.addWidget(self.sv_all)
+        self.sv_tbl = _table(["Статус", "Служба", "Имя", "Сейчас", "По умолчанию", "Важная"], 1)
+        self.sv_tbl.customContextMenuRequested.connect(self._sv_menu)
+        cl.addWidget(self.sv_tbl, 1)
+        cl.addLayout(_row(self._scan_btn("🔎 Проверить", "Тип запуска служб из реестра", self.services_refresh),
+                          _btn("🛠 Вернуть выбранные", "", "Тип запуска по умолчанию", self._sv_fix_sel),
+                          _btn("🛠 Вернуть все ✗", "danger", "Только важные отключённые", self._sv_fix_bad),
+                          _btn("⚙ services.msc", "", "", lambda: shell_open("services.msc"))))
+        cl.addWidget(_lab("✗ — важная служба отключена (звук, поиск, сеть, защита, обновления). ⚠ — второстепенная "
+                          "(печать, Bluetooth, телеметрия…): включай, если нужна. Применяется после перезагрузки.",
+                          "hint"))
+        pl.addWidget(c, 1)
+        self.sv_rows: list = []
+
+    def services_refresh(self):
+        self._scan_into("Службы", services_scan, "sv_rows", self._sv_fill)
+
+    def _sv_fill(self):
+        vis = [r for r in self.sv_rows if self.sv_all.isChecked() or r["st"] != "ok"]
+        t = self.sv_tbl
+        t.setRowCount(len(vis))
+        for i, r in enumerate(vis):
+            t.setItem(i, 0, _cell({"ok": "✓ норма", "warn": "⚠ отключена", "bad": "✗ отключена"}[r["st"]],
+                                  ST_COLOR[r["st"]]))
+            t.setItem(i, 1, _cell(r["title"]))
+            t.setItem(i, 2, _cell(r["name"]))
+            t.setItem(i, 3, _cell(START_TXT.get(r["cur"], str(r["cur"]))))
+            t.setItem(i, 4, _cell(START_TXT[r["dflt"]] + (" (отложенно)" if r["delayed"] and r["dflt"] == 2 else "")))
+            t.setItem(i, 5, _cell("да" if r["important"] else ""))
+            t.item(i, 0).setData(Qt.UserRole, r)
+        self._status(f"Службы: отключено {sum(1 for r in self.sv_rows if r['st'] != 'ok')}")
+
+    def _sv_fix_sel(self):
+        self._apply_items("Служба", [r for r in self._sel_data(self.sv_tbl) if r["cur"] != r["dflt"]], service_fix,
+                          self.services_refresh, "Вернуть тип запуска по умолчанию:")
+
+    def _sv_fix_bad(self):
+        self._apply_items("Служба", [r for r in self.sv_rows if r["st"] == "bad"], service_fix,
+                          self.services_refresh, "Включить важные службы:")
+
+    def _sv_menu(self, pos):
+        sel = self._sel_data(self.sv_tbl)
+        self._std_menu(self.sv_tbl, pos, [
+            ("🛠 Вернуть по умолчанию", self._sv_fix_sel),
+            ("▶ Запустить сейчас", lambda: self._apply_items(
+                "Запуск", sel, lambda r: run_ps(f"Start-Service -Name {ps_quote(r['name'])}"))),
+            ("🔎 Открыть в regedit", lambda: sel and open_regedit(rf"HKLM\{SVC_KEY}\{sel[0]['name']}")),
+            ("🔎 Проверить заново", self.services_refresh)])
+
+    # ── 🧭 браузеры ──
+    def _page_browsers(self, pl):
+        c, cl = _card("Подмены в браузерах: ярлыки с сайтом, политики (стартовая, поиск, расширения)")
+        self.br_tbl = _table(["Статус", "Где", "Имя", "Значение"], 3)
+        self.br_tbl.customContextMenuRequested.connect(self._br_menu)
+        cl.addWidget(self.br_tbl, 1)
+        cl.addLayout(_row(self._scan_btn("🔎 Сканировать", "Ярлыки браузеров и политики Chrome/Edge/Firefox/Яндекс…",
+                                         self.browsers_refresh),
+                          _btn("🛠 Исправить выбранное", "", "Ярлык — убрать сайт; политика — удалить", self._br_fix_sel),
+                          _btn("🛠 Исправить все ✗", "danger", "", self._br_fix_bad)))
+        cl.addWidget(_lab("✗ ярлык браузера с адресом сайта (открывает рекламу) или политика, навязывающая стартовую "
+                          "страницу/поиск/расширения. ⚠ — прочие политики браузера. Закройте браузер перед исправлением; "
+                          "политики HKLM — с правами администратора. Всё откатывается (↩ Откат).", "hint"))
+        pl.addWidget(c, 1)
+        self.br_items: list = []
+
+    def browsers_refresh(self):
+        self._scan_into("Браузеры", browsers_scan, "br_items", self._br_fill)
+
+    def _br_fill(self):
+        t = self.br_tbl
+        t.setRowCount(len(self.br_items))
+        for i, it in enumerate(self.br_items):
+            t.setItem(i, 0, _cell({"ok": "✓", "warn": "⚠ политика", "bad": "✗ подмена"}[it["st"]], ST_COLOR[it["st"]]))
+            t.setItem(i, 1, _cell(it["src"]))
+            t.setItem(i, 2, _cell(it["name"], tip=it.get("file") or it.get("path", "")))
+            t.setItem(i, 3, _cell(it["val"]))
+            t.item(i, 0).setData(Qt.UserRole, it)
+        self._status(f"Браузеры: найдено {len(self.br_items)}")
+
+    def _br_done(self):
+        self.browsers_refresh()
+
+    def _br_fix_sel(self):
+        self._apply_items("Браузер", self._sel_data(self.br_tbl), browser_fix, self._br_done, "Исправить:")
+
+    def _br_fix_bad(self):
+        self._apply_items("Браузер", [i for i in self.br_items if i["st"] == "bad"], browser_fix, self._br_done,
+                          "Исправить все подмены (✗):")
+
+    def _br_menu(self, pos):
+        sel = self._sel_data(self.br_tbl)
+        acts = [("🛠 Исправить", self._br_fix_sel)]
+        if sel and sel[0]["kind"] == "lnk":
+            acts.append(("📂 Показать ярлык", lambda: show_in_explorer(sel[0]["file"])))
+        elif sel:
+            acts.append(("🔎 Открыть в regedit", lambda: open_regedit(f"{sel[0]['root']}\\{sel[0]['path']}")))
+        acts.append(("🔎 Сканировать заново", self.browsers_refresh))
+        self._std_menu(self.br_tbl, pos, acts)
+
+    # ── 📋 меню Проводника ──
+    def _page_ctx(self, pl):
+        c, cl = _card("Пункты контекстного меню (правый клик в Проводнике)")
+        self.cx_builtin = Toggle("Показать встроенные Windows")
+        self.cx_builtin.clicked.connect(self.ctx_refresh)
+        cl.addWidget(self.cx_builtin)
+        self.cx_tbl = _table(["Вкл", "Где", "Пункт", "Команда / DLL"], 3)
+        self.cx_tbl.customContextMenuRequested.connect(self._cx_menu)
+        cl.addWidget(self.cx_tbl, 1)
+        cl.addLayout(_row(self._scan_btn("🔎 Сканировать", "HKCR: *, Directory, Folder, Drive, фон рабочего стола",
+                                         self.ctx_refresh),
+                          _btn("⏸ Скрыть", "", "Обратимо: LegacyDisable / Shell Extensions\\Blocked",
+                               lambda: self._cx_set(False)),
+                          _btn("▶ Показать", "", "", lambda: self._cx_set(True)),
+                          _btn("🗑 Удалить", "danger", "Удалить ключ (сохраняется в ↩ Откат)", self._cx_del),
+                          _btn("🔄 Перезапустить Проводник", "", "Чтобы меню обновилось", self.sys_explorer)))
+        cl.addWidget(_lab("* — все файлы, Directory — папки, Background — пустое место в папке, Drive — диски. "
+                          "Сначала «Скрыть», проверить меню, потом «Удалить». Изменения в HKLM — с правами "
+                          "администратора.", "hint"))
+        pl.addWidget(c, 1)
+        self.cx_items: list = []
+
+    def ctx_refresh(self):
+        self._scan_into("Меню Проводника", ctx_scan, "cx_items", self._cx_fill, self.cx_builtin.isChecked())
+
+    def _cx_fill(self):
+        t = self.cx_tbl
+        t.setRowCount(len(self.cx_items))
+        for i, it in enumerate(self.cx_items):
+            t.setItem(i, 0, _cell("✓" if it["on"] else "⏸", _OK if it["on"] else _ERR))
+            t.setItem(i, 1, _cell(it["where"], tip=it["path"]))
+            t.setItem(i, 2, _cell(it["title"] + (" (Windows)" if it["builtin"] else ""), tip=it["name"]))
+            t.setItem(i, 3, _cell(it["cmd"]))
+            t.item(i, 0).setData(Qt.UserRole, it)
+        self._status(f"Меню Проводника: {len(self.cx_items)}")
+
+    def _cx_set(self, on):
+        self._apply_items("Показан" if on else "Скрыт", self._sel_data(self.cx_tbl),
+                          lambda it: ctx_set_on(it, on), self._cx_fill)
+
+    def _cx_del(self):
+        self._apply_items("Удалён", self._sel_data(self.cx_tbl), lambda it: reg_delete_tree("HKCR", it["path"]),
+                          self.ctx_refresh, "Удалить из меню Проводника:")
+
+    def _cx_menu(self, pos):
+        sel = self._sel_data(self.cx_tbl)
+        self._std_menu(self.cx_tbl, pos, [
+            ("⏸ Скрыть", lambda: self._cx_set(False)), ("▶ Показать", lambda: self._cx_set(True)),
+            ("🗑 Удалить…", self._cx_del), None,
+            ("📂 Показать файл", lambda: sel and show_in_explorer(sel[0]["cmd"])),
+            ("🔎 Открыть в regedit", lambda: sel and open_regedit(f"HKCR\\{sel[0]['path']}")),
+            ("🔎 Сканировать заново", self.ctx_refresh)])
+
+    # ── 🏴 активаторы ──
+    def _page_kms(self, pl):
+        c, cl = _card("Следы активаторов (KMSAuto, AAct, KMSpico, KMS_VL_ALL…)")
+        self.km_tbl = _table(["Статус", "Тип", "Имя", "Значение"], 3)
+        self.km_tbl.customContextMenuRequested.connect(self._km_menu)
+        cl.addWidget(self.km_tbl, 1)
+        cl.addLayout(_row(self._scan_btn("🔎 Сканировать", "Задачи, службы, файлы, IFEO, KMS-сервер, исключения Defender",
+                                         self.kms_refresh),
+                          _btn("🗑 Удалить выбранное", "danger", "Задача/файл/исключение — откатываются", self._km_del),
+                          _btn("🔑 Статус активации", "", "slmgr /dli",
+                               lambda: shell_open(os.path.join(WINDIR, "System32", "cscript.exe"),
+                                                  "//nologo " + os.path.join(WINDIR, "System32", "slmgr.vbs") + " /dli"))))
+        cl.addWidget(_lab("⚠ Удаление следов активатора может сбросить активацию Windows/Office. Исключения Defender "
+                          "сборки добавляют, чтобы антивирус не видел активатор: ✗ — исключён весь диск/Windows или "
+                          "папка активатора. Удалённая служба при откате не вернётся (только тип запуска).", "hint"))
+        pl.addWidget(c, 1)
+        self.km_items: list = []
+
+    def kms_refresh(self):
+        self._scan_into("Активаторы", kms_scan, "km_items", self._km_fill)
+
+    def _km_fill(self):
+        t = self.km_tbl
+        t.setRowCount(len(self.km_items))
+        for i, it in enumerate(self.km_items):
+            t.setItem(i, 0, _cell({"ok": "✓", "warn": "⚠ проверить", "bad": "✗ след"}[it["st"]], ST_COLOR[it["st"]]))
+            t.setItem(i, 1, _cell(it["src"]))
+            t.setItem(i, 2, _cell(it["name"]))
+            t.setItem(i, 3, _cell(it["val"]))
+            t.item(i, 0).setData(Qt.UserRole, it)
+        self._status(f"Активаторы: найдено {len(self.km_items)}")
+
+    def _km_del(self):
+        self._apply_items("Удалено", self._sel_data(self.km_tbl), kms_delete, self.kms_refresh,
+                          "Удалить следы активатора?\n(Активация Windows/Office может слететь.)")
+
+    def _km_menu(self, pos):
+        sel = self._sel_data(self.km_tbl)
+        acts = [("🗑 Удалить…", self._km_del)]
+        if sel and sel[0]["kind"] == "file":
+            acts.append(("📂 Показать", lambda: show_in_explorer(sel[0]["path"])))
+        if sel and sel[0]["kind"] == "reg":
+            acts.append(("🔎 Открыть в regedit", lambda: open_regedit(f"HKLM\\{sel[0]['path']}")))
+        if sel and sel[0]["kind"] == "task":
+            acts.append(("🗓 Планировщик", lambda: shell_open("taskschd.msc")))
+        acts.append(("🔎 Сканировать заново", self.kms_refresh))
+        self._std_menu(self.km_tbl, pos, acts)
+
+    # ── 🌐 сеть ──
+    def _page_net(self, pl):
+        c, cl = _card("DNS-серверы адаптеров")
+        self.dn_tbl = _table(["Статус", "Адаптер", "DNS", "Чьи"], 3)
+        self.dn_tbl.customContextMenuRequested.connect(self._dn_menu)
+        cl.addWidget(self.dn_tbl, 1)
+        cl.addLayout(_row(self._scan_btn("🔎 Проверить DNS", "Get-DnsClientServerAddress", self.dns_refresh),
+                          _btn("↺ DNS автоматически", "", "Сбросить на выдаваемые роутером (DHCP) — для выбранных",
+                               self._dn_reset)))
+        cl.addWidget(_lab("⚠ неизвестный DNS — сборка или вирус могли подменить сервер (реклама, фишинг). "
+                          "Роутер/локальный и известные публичные (Google, Cloudflare, Яндекс…) — норма.", "hint"))
+        pl.addWidget(c, 1)
+        c, cl = _card("Сброс сети")
+        btns = []
+        for key, text, tip in (("flushdns", "🧹 Очистить кэш DNS", "ipconfig /flushdns"),
+                               ("winsock", "🔧 Сброс Winsock", "netsh winsock reset — после перезагрузки"),
+                               ("tcpip", "🔧 Сброс TCP/IP", "netsh int ip reset — после перезагрузки"),
+                               ("winhttp", "🔧 Сброс прокси WinHTTP", "netsh winhttp reset proxy")):
+            b = _btn(text, "", tip, lambda _=False, k=key: self._net(k))
+            self.busy_btns.append(b)
+            btns.append(b)
+        cl.addLayout(_row(*btns, _btn("🌐 Параметры сети", "chip", "ms-settings:network",
+                                      lambda: shell_open("ms-settings:network"))))
+        cl.addWidget(_lab("Помогает, если после сборки «нет интернета», не открываются сайты или стоит чужой прокси. "
+                          "Нужны права администратора. Прокси браузера — 🩺 Реестр → «Прокси».", "hint"))
+        pl.addWidget(c)
+        self.dn_rows: list = []
+
+    def dns_refresh(self):
+        self._scan_into("DNS", dns_scan, "dn_rows", self._dn_fill)
+
+    def _dn_fill(self):
+        t = self.dn_tbl
+        t.setRowCount(len(self.dn_rows))
+        for i, r in enumerate(self.dn_rows):
+            t.setItem(i, 0, _cell("✓ норма" if r["st"] == "ok" else "⚠ проверить", ST_COLOR[r["st"]]))
+            t.setItem(i, 1, _cell(r["alias"]))
+            t.setItem(i, 2, _cell(", ".join(r["servers"])))
+            t.setItem(i, 3, _cell(r["note"]))
+            t.item(i, 0).setData(Qt.UserRole, r)
+
+    def _dn_reset(self):
+        self._apply_items("DNS автоматически", self._sel_data(self.dn_tbl), dns_reset, self.dns_refresh,
+                          "Сбросить DNS на автоматический (от роутера):")
+
+    def _net(self, key):
+        if key in ("winsock", "tcpip") and not self._ask(f"{NET_CMDS[key][1]}.\nВыполнить?"):
+            return
+        self.worker.run("сеть", net_cmd, key, journal=False)
+
+    def _dn_menu(self, pos):
+        self._std_menu(self.dn_tbl, pos, [("↺ DNS автоматически", self._dn_reset),
+                                          ("🔎 Проверить заново", self.dns_refresh)])
+
+    # ── ↩ откат ──
+    def _page_undo(self, pl):
+        c, cl = _card("Журнал изменений (backup)")
+        self.un_tbl = _table(["Статус", "Когда", "Действие", "Изменений"], 2)
+        self.un_tbl.customContextMenuRequested.connect(self._un_menu)
+        cl.addWidget(self.un_tbl, 1)
+        b = _btn("↩ Откатить выбранное", "primary", "Вернуть всё, что изменило это действие", self._un_undo)
+        self.busy_btns.append(b)
+        cl.addLayout(_row(b, _btn("🔄 Обновить", "", "", self.undo_refresh),
+                          _btn("📁 Папка backup", "", str(BACKUP_DIR), self._un_folder),
+                          _btn("🗑 Удалить запись", "danger", "Удалить файл журнала", self._un_delete)))
+        cl.addWidget(_lab("Каждое действие WinFix (реестр, файлы, ярлыки, задачи, DNS, исключения) сохраняет "
+                          "старые значения в backup\\undo_*.json. Откатывайте сверху вниз — от новых к старым.", "hint"))
+        pl.addWidget(c, 1)
+
+    def undo_refresh(self):
+        rows = journal_list()
+        t = self.un_tbl
+        t.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            t.setItem(i, 0, _cell("↩ откачено" if r["done"] else "● активно", _WARN if r["done"] else _OK))
+            t.setItem(i, 1, _cell(r["time"]))
+            t.setItem(i, 2, _cell(r["title"], tip=r["file"]))
+            t.setItem(i, 3, _cell(r["n"]))
+            t.item(i, 0).setData(Qt.UserRole, r)
+        self._status(f"Откат: записей {len(rows)}")
+
+    def _un_undo(self):
+        sel = [r for r in self._sel_data(self.un_tbl) if not r["done"]]
+        if not sel:
+            return log.warning("⚠ Выберите активную запись")
+        if not self._ask("Откатить:\n\n" + "\n".join(f"{r['time']}  {r['title']}" for r in sel)):
+            return
+
+        def job():
+            for r in sel:
+                journal_undo(r["file"])
+        self.worker.run("откат", job, then=self.undo_refresh, journal=False)
+
+    def _un_folder(self):
+        BACKUP_DIR.mkdir(exist_ok=True)
+        shell_open(str(BACKUP_DIR))
+
+    def _un_delete(self):
+        sel = self._sel_data(self.un_tbl)
+        if sel and self._ask(f"Удалить записи журнала ({len(sel)})? Откатить их будет нельзя."):
+            for r in sel:
+                Path(r["file"]).unlink(missing_ok=True)
+            self.undo_refresh()
+
+    def _un_menu(self, pos):
+        sel = self._sel_data(self.un_tbl)
+        self._std_menu(self.un_tbl, pos, [("↩ Откатить", self._un_undo),
+                                          ("📄 Открыть файл", lambda: sel and shell_open(sel[0]["file"])),
+                                          ("🗑 Удалить запись…", self._un_delete), ("🔄 Обновить", self.undo_refresh)])
+
+    # ── 🪄 мастер, отчёт, оформление, обновления ──
+    def fix_all(self):
+        if not self._ask("Исправить всё одной кнопкой?\n\n1. Точка восстановления\n2. Стандартный курсор\n"
+                         "3. Стандартные звуки\n4. Реестр — только ✗\n5. Важные отключённые службы\n\n"
+                         "Всё попадёт в одну запись ↩ Отката."):
+            return
+        self.worker.run("исправить всё", fix_all, self.checks, then=self._after_fix_all)
+
+    def _after_fix_all(self):
+        self._refresh_light()
+        self.undo_refresh()
+
+    def make_report(self):
+        def job():
+            f = build_report(self.checks)
+            log.info(f"✓ Отчёт: {f}")
+            ui(lambda: shell_open(str(f)))
+        self.worker.run("отчёт", job, journal=False)
+
+    def _theme_default(self):
+        if self._ask("Применить стандартную тему Windows (aero.theme)?\nОткроются Параметры → Персонализация."):
+            shell_open(str(THEME_FILE))
+
+    def _wallpaper(self):
+        self.worker.run("обои", lambda: (wallpaper_default(), log.info(f"✓ Обои: {WALLPAPER}")))
+
+    def _oem_clear(self):
+        info = oem_info()
+        if not info:
+            return log.info("✓ OEM-сведений нет")
+        if self._ask("Убрать из «Сведений о системе»:\n\n" + "\n".join(f"{k}: {v}" for k, v in info.items())):
+            self.worker.run("OEM-сведения", lambda: (oem_clear(), log.info("✓ OEM-сведения удалены"),
+                                                     ui(self._oem_show)))
+
+    def _oem_show(self):
+        info = oem_info()
+        self.oem_lbl.setText(("OEM: " + " · ".join(f"{k}={v}" for k, v in info.items())) if info
+                             else "OEM-сведений нет ✓")
+
+    def check_update(self):
+        def job():
+            res = update_check()
+            if res is None:
+                return log.info(f"Релизов на GitHub нет (или репозиторий закрыт): {UPDATE_REPO}")
+            tag, url = res
+            if _ver(tag) > _ver(VERSION):
+                log.warning(f"⚠ Доступна новая версия {tag} (у вас {VERSION})")
+                ui(lambda: self._ask(f"Доступна версия {tag}. Открыть страницу загрузки?") and webbrowser.open(url))
+            else:
+                log.info(f"✓ У вас последняя версия ({VERSION})")
+        self.worker.run("проверка обновлений", job, journal=False)
+
     # ── 🎨 тема ──
     def _page_theme(self, pl):
         c, cl = _card("Тема")
@@ -2304,6 +3448,12 @@ class App(QMainWindow):
         cl.addLayout(_row(_btn("💾 Сохранить", "primary", "", lambda: (save_config(self._cfg_snapshot()),
                                                                        log.info("✓ Настройки сохранены")))))
         cl.addWidget(_lab(f"{APP_NAME} v{VERSION} · настройки: {CONFIG_PATH}", "hint"))
+        pl.addWidget(c)
+        c, cl = _card("Обновления")
+        b = _btn("🔄 Проверить версию", "", f"GitHub: {UPDATE_REPO}", self.check_update)
+        self.busy_btns.append(b)
+        cl.addLayout(_row(b, _btn("🌐 Релизы", "chip", "", lambda: webbrowser.open(
+            f"https://github.com/{UPDATE_REPO}/releases"))))
         pl.addWidget(c)
         c, cl = _card("Логи")
         self.verbose_tg = Toggle("Подробно в окне (команды, реестр, коды)")
@@ -2334,6 +3484,8 @@ class App(QMainWindow):
             self.sound_refresh()
             self._st_fill()
             self._pt_fill()
+            for fill in (self._sv_fill, self._br_fill, self._cx_fill, self._km_fill, self._dn_fill):
+                fill()
             if self.check_res:
                 self._rg_fill(self.check_res)
         self._themed = True

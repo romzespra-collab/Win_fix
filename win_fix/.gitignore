@@ -7,3 +7,5 @@ dist/
 release/
 selftest.txt
 removed_startup/
+backup/
+reports/
