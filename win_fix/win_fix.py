@@ -1,9 +1,15 @@
 r"""
-win_fix.py  v1.7.1
+win_fix.py  v1.7.2
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.7.2: чистка реестра по реальному списку пользователя (121 → без ложных):
+        убрана проверка CLSID→AppID (в LRC она фактически не работала; у COM из Магазина AppID в пакете);
+        иконка «"путь,1"» в кавычках разбирается верно (Telegram); иконка по имени без папки не проверяется;
+        32-битные записи, указывающие в SysWOW64, проверяются и в System32 (Speech, AuthHost, SmartScreen…);
+        App Paths без пути, но со значениями — норма Windows; записи установки без имени — ⚠ без галочки;
+        отсутствующие файлы внутри C:\Windows — ⚠ без галочки (вырезаны сборкой, DISM+SFC вернёт).
 v1.7.1: ИСПРАВЛЕНО: ложные «нет файла» у 32-битных COM (Wow6432Node): 64-битный Python раскрывал %ProgramFiles%
         как «Program Files», а не «(x86)» — теперь файл «отсутствует», только если его нет ни в одном толковании
         (Program Files / (x86), System32 / SysWOW64); в строке COM — имя класса и пометка [32-бит].
@@ -115,7 +121,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -2260,7 +2266,7 @@ def backup_size() -> int:
 # Правила — по образцу Little Registry Cleaner (github.com/little-apps, GPL): проверяются только ссылки на файлы,
 # классы, CLSID и AppID, которых нет. «Пустые классы» и прочие догадки — не ищем (дают ложные срабатывания).
 RC_CATS = [("fileexts", "Неиспользуемые расширения файлов"), ("badclass", "Расширение → нет класса"),
-           ("classicon", "Класс: нет файла иконки"), ("com", "ActiveX/COM: нет файла или AppID"),
+           ("classicon", "Класс: нет файла иконки"), ("com", "ActiveX/COM: нет файла"),
            ("apppaths", "Ошибки путей приложений"), ("installer", "Ошибки установки приложений"),
            ("software", "Пустой программный ключ"), ("uninst", "Записи установки: неверные пути"),
            ("firewall", "Неверное правило брандмауэра"), ("mui", "Устаревшие ссылки MUI"),
@@ -2297,7 +2303,7 @@ def _sanitize(p: str, icon: bool = False) -> str:
         p = p.lstrip("@")
         if p.startswith('"'):
             p = p[1:].split('"', 1)[0]
-        elif "," in p:
+        if re.search(r",\s*-?\d+\s*$", p):  # «путь,1» — и без кавычек, и внутри них
             p = p.rsplit(",", 1)[0]
     p = os.path.expandvars(p.strip().strip('"')).strip()
     return "" if re.search(r'[<>|"*?]', p) else p
@@ -2316,7 +2322,8 @@ def _wow_variants(raw: str) -> list:
     x86 = re.sub(r"(?i)%(ProgramFiles|CommonProgramFiles)%", r"%\1(x86)%", raw)
     x86 = re.sub(r"(?i)\\Program Files\\", r"\\Program Files (x86)\\", x86)
     for v in (x86, re.sub(r"(?i)\\system32\\", r"\\SysWOW64\\", raw),
-              re.sub(r"(?i)\\system32\\", r"\\SysWOW64\\", x86)):
+              re.sub(r"(?i)\\system32\\", r"\\SysWOW64\\", x86),
+              re.sub(r"(?i)\\syswow64\\", r"\\System32\\", raw)):  # 32-бит запись на 64-бит сервер Windows
         if v not in out:
             out.append(v)
     return out
@@ -2344,7 +2351,7 @@ def _path_state(p: str, icon: bool = False, wow32: bool = False, kind: str = "an
         p = re.sub(r"(?i)\\system32\\", r"\\Sysnative\\", p)
     drive, _r = os.path.splitdrive(p)
     if not drive and not os.path.isabs(p):
-        if not os.path.splitext(p)[1] or os.sep in p or "/" in p:
+        if icon or not os.path.splitext(p)[1] or os.sep in p or "/" in p:  # иконка по имени — ищется не по PATH
             return "skip"  # не имя файла (или относительный путь) — не проверяем
         return "ok" if _search_path(p) or _search_path(p, True) else "missing"
     if drive:
@@ -2438,15 +2445,6 @@ def regclean_scan(cats=None, ignore=None) -> list:
                             cname = reg_get(root, k, "")
                             add("com", f"{c}" + (f" «{cname}»" if isinstance(cname, str) and cname else "")
                                 + f" {srv}: {v}" + (" [32-бит]" if w32 else ""), root, rf"{k}\{srv}", "tree", state=s)
-                appid = reg_get(root, k, "AppID")
-                if isinstance(appid, str) and GUID_RE.match(appid) and not _key_exists_any(rf"AppID\{appid}"):
-                    add("com", f"{c}: AppID {appid} нет", root, k, "val", name="AppID")
-            ap = rf"{base}\AppID" if base else "AppID"
-            for a in reg_subkeys(root, ap):  # AppID\program.exe → AppID {guid}, которого нет
-                ref = reg_get(root, rf"{ap}\{a}", "AppID")
-                if not GUID_RE.match(a) and isinstance(ref, str) and GUID_RE.match(ref) \
-                        and not _key_exists_any(rf"AppID\{ref}"):
-                    add("com", f"{a} → AppID {ref} нет", root, rf"{ap}\{a}", "tree")
     if "apppaths" in cats:
         for n, _v, _t in reg_values("HKCU", COMPAT_STORE):
             s = _path_state(n, kind="file")
@@ -2463,7 +2461,8 @@ def regclean_scan(cats=None, ignore=None) -> list:
                 continue
             app, d = reg_get("HKLM", k, ""), reg_get("HKLM", k, "Path")
             if not isinstance(app, str) or not app.strip():
-                add("apppaths", f"{exe}: путь пуст", "HKLM", k, "tree")
+                if not reg_values("HKLM", k) and not reg_subkeys("HKLM", k):  # у Windows бывают ключи без пути
+                    add("apppaths", f"{exe}: пустой ключ", "HKLM", k, "tree")
                 continue
             s = _path_state(app, kind="file")
             if _bad(s) and isinstance(d, str) and d.strip():
@@ -2496,7 +2495,10 @@ def regclean_scan(cats=None, ignore=None) -> list:
                 if vals.get("windowsinstaller") == 1:
                     continue
                 if not vals.get("displayname") and not vals.get("uninstallstring"):
-                    add("uninst", f"{sub}: нет имени и деинсталлятора", root, k, "tree")
+                    if vals.get("systemcomponent") != 1:
+                        it = _rc_item("uninst", f"{sub}: нет имени и деинсталлятора", root, k, "tree")
+                        it.update(st="warn", note="служебная запись (часто Windows) — проверьте сами, не отмечено")
+                        out.append(it)
                     continue
                 for vn, kind, icon in (("DisplayIcon", "file", True), ("InstallLocation", "any", False),
                                        ("InstallSource", "any", False)):
@@ -2574,6 +2576,11 @@ def regclean_scan(cats=None, ignore=None) -> list:
         for n, _v, _t in reg_values("HKLM", tb):
             if GUID_RE.match(n) and not _key_exists_any(rf"CLSID\{n}"):
                 add("explorer", f"Панель IE {n}", "HKLM", tb, "val", name=n)
+    win = WINDIR.lower() + "\\"
+    for it in out:  # файл Windows отсутствует — скорее вырезан сборкой; DISM+SFC вернёт, запись ещё понадобится
+        if it["cat"] in ("com", "classicon", "apppaths", "shareddll") and win in os.path.expandvars(it["data"]).lower() \
+                and it["st"] == "bad":
+            it.update(st="warn", note="файл Windows отсутствует (вырезан сборкой?) — DISM+SFC вернёт его; не отмечено")
     if ignore:
         out = [i for i in out if not rc_ignored(i, ignore)]
     return out
