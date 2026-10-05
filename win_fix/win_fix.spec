@@ -1,5 +1,6 @@
-# win_fix.spec  v1.3.2
+# win_fix.spec  v1.3.3
 # Журнал:
+# v1.3.3: uac_admin=False — права просит сама программа (иначе --selftest в build_exe.bat падает: ошибка 740).
 # v1.3.2: без изменений сборки.
 # v1.3.1: без изменений сборки.
 # v1.3.0: без изменений сборки.
@@ -14,4 +15,4 @@ a = Analysis(['win_fix.py'], pathex=[], binaries=[], datas=[], hiddenimports=[],
              noarchive=False)
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name='win_fix', debug=False, strip=False,
-          upx=False, console=False, uac_admin=True)
+          upx=False, console=False, uac_admin=False)

@@ -1,9 +1,23 @@
 r"""
-win_fix.py  v1.3.2
+win_fix.py  v1.3.3
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.3.3: исправления по полному анализу: QSS + QPalette для всех окон (QFileDialog, списки, комбо — без
+        светлого текста на светлом); лог перекрашивается при смене темы; цвета статусов под тему;
+        EXE без uac_admin (права просит сама программа, --selftest в build_exe.bat не падает);
+        удаление из автозагрузки — shutil.move + уникальное имя (работает между дисками);
+        тумблер мелодии и размер курсора не «врут», если действие не выполнилось (размер — с задержкой);
+        цепочки действий (исправить → проверить) без гонки — Worker(then=…);
+        точка восстановления создаётся всегда (обход лимита 24 ч) и проверяется;
+        восстановленные курсоры — владелец TrustedInstaller и исходные права;
+        статус курсора считает «чужими» только ✗; подтверждение выхода во время работы;
+        в вопросах по умолчанию «Нет»; Проводник перезапускается без прав админа;
+        «Папка процесса»/«Завершить» — в фоне; regedit: любой язык, HKU/HKCR, /m;
+        IFEO — пропуск замены диспетчера на Process Explorer/System Informer; hosts — чужие строки
+        комментируются, а не стираются; автозагрузка: Policies\Run, службы, Active Setup;
+        проверка Defender: DisableRealtimeMonitoring; --selftest создаёт окно и применяет обе темы.
 v1.3.2: окна вопросов/сообщений (QMessageBox) в цветах темы — текст был не читаем;
         курсоры *_eoa.cur из AppData\Local\Microsoft\Windows\Cursors — это файлы самой Windows
         (Специальные возможности), больше не помечаются «чужое».
@@ -35,16 +49,18 @@ import logging
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
+from collections import deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -103,13 +119,13 @@ ensure_packages()
 
 from PySide6.QtCore import QByteArray, QRectF, QSize, Qt, QTimer, Signal  # noqa: E402
 from PySide6.QtGui import (QAction, QColor, QFont, QGuiApplication, QPainter,  # noqa: E402
-                           QTextCharFormat, QTextCursor)
+                           QPalette, QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication,  # noqa: E402
                                QButtonGroup, QFileDialog, QFrame, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
                                QMessageBox, QPlainTextEdit, QPushButton, QSplitter,
                                QStackedWidget, QTableWidget, QTableWidgetItem,
-                               QToolButton, QVBoxLayout, QWidget)
+                               QVBoxLayout, QWidget)
 
 try:
     import winreg as wr
@@ -433,14 +449,31 @@ def reg_delete_tree(root, path) -> None:
     wr.DeleteKey(HK[root], path) if reg_key_exists(root, path) else None
 
 
-def open_regedit(key: str) -> None:
+HK_FULL = {"HKCU": "HKEY_CURRENT_USER", "HKLM": "HKEY_LOCAL_MACHINE", "HKCR": "HKEY_CLASSES_ROOT",
+           "HKU": "HKEY_USERS"}
+REGEDIT_KEY = r"Software\Microsoft\Windows\CurrentVersion\Applets\Regedit"
+
+
+def _regedit_root() -> str:
+    """Корень в адресной строке regedit («Компьютер» / «Computer» …) — зависит от языка Windows."""
+    last = reg_get("HKCU", REGEDIT_KEY, "LastKey") or ""
+    if "\\HKEY_" in last:
+        return last.split("\\HKEY_", 1)[0]
     try:
-        full = key.replace("HKCU", "HKEY_CURRENT_USER").replace("HKLM", "HKEY_LOCAL_MACHINE")
-        reg_set("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Applets\Regedit", "LastKey",
-                "Компьютер\\" + full)
+        ru = (ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF) == 0x19
     except Exception:
-        pass
-    shell_open("regedit.exe")
+        ru = False
+    return "Компьютер" if ru else "Computer"
+
+
+def open_regedit(key: str) -> None:
+    head, _, rest = key.partition("\\")
+    full = HK_FULL.get(head.upper(), head) + ("\\" + rest if rest else "")
+    try:
+        reg_set("HKCU", REGEDIT_KEY, "LastKey", _regedit_root() + "\\" + full)
+    except Exception:
+        log.debug("LastKey не записан", exc_info=True)
+    shell_open("regedit.exe", "/m")  # /m — новое окно, иначе открытый regedit игнорирует LastKey
 
 
 # ───────────────────────── курсор ─────────────────────────
@@ -524,6 +557,11 @@ foreach($f in Get-ChildItem $hit.FullName -File | ?{ $_.Extension -in '.cur','.a
       icacls "$t" /grant '*S-1-5-32-544:F' | Out-Null
     }
     Copy-Item $f.FullName $t -Force -ErrorAction Stop
+    # права как у оригинала: владелец TrustedInstaller, остальным — чтение
+    icacls "$t" /inheritance:r /grant:r 'NT SERVICE\TrustedInstaller:F' '*S-1-5-32-544:RX' '*S-1-5-18:RX' `
+      '*S-1-5-32-545:RX' '*S-1-15-2-1:RX' | Out-Null
+    icacls "$t" /setowner 'NT SERVICE\TrustedInstaller' | Out-Null
+    if($LASTEXITCODE){ 'OWNER ' + $f.Name }
     'OK ' + $f.Name
   }catch{ 'FAIL ' + $f.Name + ' : ' + $_.Exception.Message }
 }
@@ -544,10 +582,13 @@ def cursor_restore_files():
     ok = [x[3:] for x in lines if x.startswith("OK ")]
     same = [x for x in lines if x.startswith("SAME ")]
     fail = [x[5:] for x in lines if x.startswith("FAIL ")]
+    owner = [x[6:] for x in lines if x.startswith("OWNER ")]
     for x in lines:
         if x.startswith("SRC "):
             log.info(f"   источник: {x[4:]}")
     log.info(f"✓ Восстановлено файлов: {len(ok)}, уже оригинальных: {len(same)}")
+    if owner:
+        log.warning(f"⚠ Владелец TrustedInstaller не назначен ({len(owner)}): " + ", ".join(owner[:6]))
     for f in fail[:10]:
         log.error(f"✗ {f}")
     if err.strip() and not lines:
@@ -652,7 +693,11 @@ RUN_KEYS = [("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Run", "Run"),
             ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "Run"),
             ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", None),
             ("HKLM", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run", "Run32"),
-            ("HKLM", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce", None)]
+            ("HKLM", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce", None),
+            ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run", None),
+            ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run", None)]
+ACTIVE_SETUP = [r"SOFTWARE\Microsoft\Active Setup\Installed Components",
+                r"SOFTWARE\WOW6432Node\Microsoft\Active Setup\Installed Components"]
 MUSIC_RE = re.compile(r"\.(mp3|wav|wma|ogg|flac|m4a|aac|mid|midi)\b|wmplayer|vlc|aimp|foobar|winamp|"
                       r"mpc-hc|potplayer|soundplayer|playsound|mplay32|sndrec|musicbee|groove", re.I)
 
@@ -721,6 +766,30 @@ def startup_scan():
                                   tpath=t["p"], on=t["s"] != "Disabled"))
         except Exception as e:
             log.warning(f"⚠ Планировщик не прочитан: {e}")
+        code, out, _ = run_ps(
+            "@(Get-CimInstance Win32_Service | ?{ $_.StartMode -in 'Auto','Disabled' -and $_.PathName -and "
+            "$_.PathName -notlike \"*$env:SystemRoot*\" -and $_.PathName -notmatch 'Windows Defender' } | "
+            "%{[pscustomobject]@{n=$_.Name;d=$_.DisplayName;p=$_.PathName;m=[string]$_.StartMode}}) "
+            "| ConvertTo-Json -Compress", timeout=90)
+        try:
+            res = json.loads(out or "[]")
+            res = [res] if isinstance(res, dict) else res
+            for t in res:
+                items.append(dict(kind="svc", src="Службы (не Windows)", name=f"{t['d']} ({t['n']})",
+                                  svc=t["n"], cmd=t.get("p") or "", on=t["m"] != "Disabled"))
+        except Exception as e:
+            log.warning(f"⚠ Службы не прочитаны: {e}")
+    win = WINDIR.lower()
+    for path in ACTIVE_SETUP:
+        for guid in reg_subkeys("HKLM", path):
+            key = rf"{path}\{guid}"
+            stub = reg_get("HKLM", key, "StubPath")
+            if not stub or reg_get("HKLM", key, "IsInstalled") in (0, b"\x00\x00\x00\x00"):
+                continue
+            if win in os.path.expandvars(str(stub)).lower() or "%systemroot%" in str(stub).lower():
+                continue
+            items.append(dict(kind="asetup", src="Active Setup", name=reg_get("HKLM", key, "") or guid,
+                              cmd=str(stub), root="HKLM", path=key, on=True))
     for it in items:
         it["music"] = bool(MUSIC_RE.search(it["cmd"] + " " + it["name"]))
     return items
@@ -732,11 +801,25 @@ def startup_set_on(it: dict, on: bool):
         code, _o, err = run_ps(f"{verb}-ScheduledTask -TaskPath {ps_quote(it['tpath'])} -TaskName {ps_quote(it['name'])}")
         if code:
             raise RuntimeError(err.strip() or "нет прав (нужен администратор)")
+    elif it["kind"] == "svc":
+        code, _o, err = run_ps(f"Set-Service -Name {ps_quote(it['svc'])} "
+                               f"-StartupType {'Automatic' if on else 'Disabled'} -ErrorAction Stop")
+        if code:
+            raise RuntimeError(err.strip() or "нет прав (нужен администратор)")
     elif it.get("appr"):
         _approved_set(it["root"], it["appr"], it["name"], on)
     else:
-        raise RuntimeError("RunOnce нельзя отключить — только удалить")
+        raise RuntimeError("RunOnce / Policies / Active Setup нельзя отключить — только удалить")
     it["on"] = on
+
+
+def _unique(path: Path) -> Path:
+    n = 1
+    out = path
+    while out.exists():
+        out = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        n += 1
+    return out
 
 
 def startup_delete(it: dict):
@@ -744,11 +827,16 @@ def startup_delete(it: dict):
         reg_del(it["root"], it["path"], it["name"])
         if it.get("appr"):
             reg_del(it["root"], rf"{APPROVED}\{it['appr']}", it["name"])
+    elif it["kind"] == "asetup":
+        reg_del("HKLM", it["path"], "StubPath")
+    elif it["kind"] == "svc":
+        raise RuntimeError("службу не удаляю — только «⏸ Отключить»")
     elif it["kind"] == "file":
         dst = APP_ROOT / "removed_startup"
         dst.mkdir(exist_ok=True)
-        os.replace(it["file"], dst / it["name"])
-        log.info(f"   файл перенесён в {dst}")
+        target = _unique(dst / it["name"])
+        shutil.move(it["file"], target)  # между дисками os.replace не работает
+        log.info(f"   файл перенесён: {target}")
     else:
         code, _o, err = run_ps(f"Unregister-ScheduledTask -TaskPath {ps_quote(it['tpath'])} "
                                f"-TaskName {ps_quote(it['name'])} -Confirm:$false")
@@ -762,10 +850,7 @@ POL_SYS = r"Software\Microsoft\Windows\CurrentVersion\Policies\System"
 POL_EXP = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
 IFEO = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
 HOSTS = Path(WINDIR) / r"System32\drivers\etc\hosts"
-HOSTS_DEFAULT = ("# Copyright (c) 1993-2009 Microsoft Corp.\r\n#\r\n"
-                 "# This is a sample HOSTS file used by Microsoft TCP/IP for Windows.\r\n#\r\n"
-                 "# localhost name resolution is handled within DNS itself.\r\n"
-                 "#\t127.0.0.1       localhost\r\n#\t::1             localhost\r\n")
+HOSTS_OK = {"localhost", "localhost.localdomain"}
 
 
 def _absent_or0(root, path, name):
@@ -777,8 +862,22 @@ def _policy_check(root, path, name):
     return lambda: _absent_or0(root, path, name), lambda: reg_del(root, path, name)
 
 
+IFEO_OK = re.compile(r"procexp|systeminformer|processhacker", re.I)  # замена диспетчера задач — легально
+
+
 def _ifeo_list():
-    return [k for k in reg_subkeys("HKLM", IFEO) if reg_get("HKLM", rf"{IFEO}\{k}", "Debugger")]
+    """Программы с IFEO Debugger, кроме замены taskmgr на Process Explorer / System Informer."""
+    out = []
+    for k in reg_subkeys("HKLM", IFEO):
+        dbg = reg_get("HKLM", rf"{IFEO}\{k}", "Debugger")
+        if dbg and not (k.lower() == "taskmgr.exe" and IFEO_OK.search(str(dbg))):
+            out.append((k, str(dbg)))
+    return out
+
+
+def _hosts_bad(ln: str) -> bool:
+    t = ln.split("#", 1)[0].split()
+    return len(t) >= 2 and not set(x.lower() for x in t[1:]) <= HOSTS_OK
 
 
 def _hosts_lines():
@@ -786,15 +885,18 @@ def _hosts_lines():
         txt = HOSTS.read_text("utf-8", errors="replace")
     except Exception:
         return []
-    return [ln for ln in txt.splitlines() if ln.strip() and not ln.strip().startswith("#")
-            and "localhost" not in ln.lower()]
+    return [ln.strip() for ln in txt.splitlines() if _hosts_bad(ln)]
 
 
 def _hosts_fix():
+    """Чужие строки не стираются, а комментируются (# WinFix:) — их легко вернуть."""
+    raw = HOSTS.read_bytes()
     bak = HOSTS.with_name("hosts.bak_winfix")
-    bak.write_bytes(HOSTS.read_bytes())
-    HOSTS.write_text(HOSTS_DEFAULT, "utf-8", newline="")
-    log.info(f"   копия старого hosts: {bak}")
+    bak.write_bytes(raw)
+    txt = raw.decode("utf-8", "replace")
+    lines = [("# WinFix: " + ln) if _hosts_bad(ln) else ln for ln in txt.splitlines()]
+    HOSTS.write_text("\r\n".join(lines) + "\r\n", "utf-8", newline="")
+    log.info(f"   чужие строки закомментированы, копия: {bak}")
 
 
 def _exe_assoc():
@@ -852,8 +954,8 @@ def build_checks():
         lambda: reg_set("HKLM", r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", "AppInit_DLLs", ""),
         key=r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows")
     add("IFEO Debugger (подмена программ)", "нет",
-        lambda: (not _ifeo_list(), ", ".join(_ifeo_list()) or "нет"),
-        lambda: [reg_del("HKLM", rf"{IFEO}\{k}", "Debugger") for k in _ifeo_list()], key="HKLM\\" + IFEO)
+        lambda: (lambda L: (not L, "; ".join(f"{k} → {d}" for k, d in L) or "нет"))(_ifeo_list()),
+        lambda: [reg_del("HKLM", rf"{IFEO}\{k}", "Debugger") for k, _d in _ifeo_list()], key="HKLM\\" + IFEO)
     add("Ассоциация .exe", '"%1" %*', _exe_assoc, _exe_assoc_fix, key=r"HKCR\exefile\shell\open\command")
     add("Служба обновлений (wuauserv)", "вручную (3)",
         lambda: (reg_get("HKLM", r"SYSTEM\CurrentControlSet\Services\wuauserv", "Start") in (2, 3),
@@ -866,13 +968,17 @@ def build_checks():
     chk, fix = _policy_check("HKLM", r"SOFTWARE\Policies\Microsoft\Windows Defender", "DisableAntiSpyware")
     add("Политика: Defender выключен", "нет / 0", chk, fix, level="warn",
         key=r"HKLM\SOFTWARE\Policies\Microsoft\Windows Defender")
+    chk, fix = _policy_check("HKLM", r"SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection",
+                             "DisableRealtimeMonitoring")
+    add("Политика: защита в реальном времени выкл.", "нет / 0", chk, fix, level="warn",
+        key=r"HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection")
     IS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
     add("Прокси (ProxyEnable)", "0",
         lambda: (reg_get("HKCU", IS, "ProxyEnable") in (None, 0),
                  f"{reg_get('HKCU', IS, 'ProxyEnable')} {reg_get('HKCU', IS, 'ProxyServer') or ''}".strip()),
         lambda: reg_set("HKCU", IS, "ProxyEnable", 0), level="warn", key="HKCU\\" + IS)
-    add("Файл hosts", "только комментарии",
-        lambda: (not _hosts_lines(), f"{len(_hosts_lines())} строк: " + "; ".join(_hosts_lines()[:3])),
+    add("Файл hosts", "только localhost",
+        lambda: (lambda L: (not L, f"{len(L)} строк: " + "; ".join(L[:3])))(_hosts_lines()),
         _hosts_fix, level="warn", key=str(HOSTS))
     return C
 
@@ -920,12 +1026,36 @@ def port_rule(proto, port) -> str:
     return f"WinFix блок {proto} {port}"
 
 
+RESTORE_POINT_PS = r"""
+$k = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+$old = (Get-ItemProperty $k -Name SystemRestorePointCreationFrequency -ErrorAction SilentlyContinue).SystemRestorePointCreationFrequency
+$rc = 0
+try{
+  Set-ItemProperty $k -Name SystemRestorePointCreationFrequency -Value 0 -Type DWord   # обход лимита «1 точка в 24 ч»
+  Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction Stop
+  Checkpoint-Computer -Description 'WinFix' -RestorePointType MODIFY_SETTINGS -ErrorAction Stop -WarningVariable w
+  if($w){ 'RP_WARN ' + ($w -join ' '); $rc = 3 } else { 'RP_OK' }
+}catch{ 'RP_WARN ' + $_.Exception.Message; $rc = 1 }
+finally{
+  if($null -eq $old){ Remove-ItemProperty $k -Name SystemRestorePointCreationFrequency -ErrorAction SilentlyContinue }
+  else{ Set-ItemProperty $k -Name SystemRestorePointCreationFrequency -Value $old -Type DWord }
+}
+exit $rc
+"""
+
+
+def _explorer_running() -> bool:
+    _c, out, _ = run_cmd(["tasklist", "/fi", "IMAGENAME eq explorer.exe", "/fo", "csv", "/nh"])
+    return "explorer.exe" in out.lower()
+
+
 # ───────────────────────── Worker ─────────────────────────
 class Worker:
     def __init__(self):
         self.busy = False
 
-    def run(self, title: str, fn, *args):
+    def run(self, title: str, fn, *args, then=None):
+        """then — вызвать в UI-потоке ПОСЛЕ освобождения (можно запускать следующее действие)."""
         if self.busy:
             log.warning("⚠ Подождите — выполняется другое действие")
             return False
@@ -947,6 +1077,8 @@ class Worker:
                 log.debug(f"■ конец: {title} ({time.time() - t0:.1f} с)")
                 self.busy = False
                 LOGQ.put(_DONE_SENTINEL)
+                if then:
+                    LOGQ.put(then)
         threading.Thread(target=body, daemon=True).start()
         return True
 
@@ -956,11 +1088,33 @@ _APP = None
 # ───────────────────────── тема ─────────────────────────
 _QT_THEMES = {
     "dark": {"bg": "#1b1d23", "side": "#16181d", "panel": "#23262e", "panel2": "#2a2e38", "line": "#343946",
-             "text": "#e6e8ee", "muted": "#8a91a3", "log_bg": "#111318", "log_fg": "#d5d8e0", "accent": "#4f8cff"},
+             "text": "#e6e8ee", "muted": "#8a91a3", "log_bg": "#111318", "log_fg": "#d5d8e0", "accent": "#4f8cff",
+             "ok": "#3ecf8e", "err": "#ff5d6c", "warn": "#f5b545"},
     "light": {"bg": "#f3f4f7", "side": "#e9ebf0", "panel": "#ffffff", "panel2": "#f1f3f7", "line": "#dde1e8",
-              "text": "#1c2230", "muted": "#6b7385", "log_bg": "#fbfbfd", "log_fg": "#1c2230", "accent": "#2f6fe4"}}
-_OK, _ERR, _WARN = "#3ecf8e", "#ff5d6c", "#f5b545"
+              "text": "#1c2230", "muted": "#6b7385", "log_bg": "#fbfbfd", "log_fg": "#1c2230", "accent": "#2f6fe4",
+              "ok": "#15935a", "err": "#d42f40", "warn": "#a96a00"}}
+_OK, _ERR, _WARN = "#3ecf8e", "#ff5d6c", "#f5b545"  # меняются в _apply_theme под тему
 ST_COLOR = {"ok": _OK, "warn": _WARN, "bad": _ERR}
+
+
+def _set_status_colors(p: dict) -> None:
+    global _OK, _ERR, _WARN
+    _OK, _ERR, _WARN = p["ok"], p["err"], p["warn"]
+    ST_COLOR.update(ok=_OK, warn=_WARN, bad=_ERR)
+
+
+def _palette(p: dict) -> QPalette:
+    """Палитра для всего, что QSS не покрыл (системные части диалогов, списки, поля)."""
+    pal = QPalette()
+    for role, key in ((QPalette.Window, "panel"), (QPalette.WindowText, "text"), (QPalette.Base, "panel2"),
+                      (QPalette.AlternateBase, "panel"), (QPalette.Text, "text"), (QPalette.Button, "panel2"),
+                      (QPalette.ButtonText, "text"), (QPalette.ToolTipBase, "panel2"), (QPalette.ToolTipText, "text"),
+                      (QPalette.Highlight, "accent"), (QPalette.PlaceholderText, "muted"), (QPalette.Link, "accent")):
+        pal.setColor(role, QColor(p[key]))
+    pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+    for role in (QPalette.Text, QPalette.WindowText, QPalette.ButtonText):
+        pal.setColor(QPalette.Disabled, role, QColor(p["muted"]))
+    return pal
 ST_TEXT = {"ok": "✓ норма", "warn": "⚠ изменено", "bad": "✗ чужое"}
 
 
@@ -968,9 +1122,17 @@ def _qss(p: dict) -> str:
     return f"""
     * {{ font-family: "Segoe UI"; font-size: 10pt; color: {p['text']}; }}
     QMainWindow, QWidget#root {{ background: {p['bg']}; }}
-    QDialog, QMessageBox, QFileDialog {{ background: {p['panel']}; }}
-    QMessageBox QLabel {{ color: {p['text']}; background: transparent; }}
-    QMessageBox QPushButton {{ min-width: 80px; }}
+    QDialog, QMessageBox, QFileDialog, QInputDialog {{ background: {p['panel']}; color: {p['text']}; }}
+    QDialog QLabel, QMessageBox QLabel {{ color: {p['text']}; background: transparent; }}
+    QDialog QPushButton {{ min-width: 80px; }}
+    QAbstractItemView, QTreeView, QListView, QTextEdit, QPlainTextEdit {{ background: {p['panel2']}; color: {p['text']};
+        border: 1px solid {p['line']}; border-radius: 7px; selection-background-color: {p['accent']};
+        selection-color: #ffffff; }}
+    QComboBox, QSpinBox, QDoubleSpinBox {{ background: {p['panel2']}; color: {p['text']}; border: 1px solid {p['line']};
+        border-radius: 7px; padding: 4px 8px; }}
+    QComboBox:focus, QSpinBox:focus {{ border-color: {p['accent']}; }}
+    QComboBox QAbstractItemView {{ background: {p['panel']}; border: 1px solid {p['line']}; }}
+    QCheckBox, QRadioButton {{ background: transparent; }}
     QWidget#page {{ background: {p['bg']}; }}
     #side {{ background: {p['side']}; border-right: 1px solid {p['line']}; }}
     #side QPushButton#nav {{ border: none; border-radius: 9px; background: transparent; text-align: left;
@@ -1214,6 +1376,10 @@ class App(QMainWindow):
         self.checks = build_checks()
         self.check_res: list = []
         self.busy_btns: list = []
+        self._log_lines: deque = deque(maxlen=5000)
+        self._size_timer = QTimer(self)
+        self._size_timer.setSingleShot(True)
+        self._size_timer.timeout.connect(self._cur_size_apply)
         self.setWindowTitle(f"{APP_NAME} — v{VERSION} · Qt6")
         self.resize(1180, 780)
 
@@ -1385,8 +1551,15 @@ class App(QMainWindow):
                 self._append(str(item))
 
     def _append(self, line):
+        self._log_lines.append(line)
         sb = self.logw.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 4
+        self._render_line(line)
+        if at_bottom:
+            sb.setValue(sb.maximum())
+
+    def _render_line(self, line):
+        """Цвет — из текущей темы; при смене темы лог перерисовывается (_rerender_log)."""
         fmt = QTextCharFormat()
         p = _QT_THEMES[self.cfg.get("theme", "dark")]
         fmt.setForeground(QColor(_ERR if ("✗" in line or "⛔" in line) else _WARN if "⚠" in line
@@ -1397,8 +1570,21 @@ class App(QMainWindow):
         if not self.logw.document().isEmpty():
             cur.insertBlock()
         cur.insertText(line, fmt)
-        if at_bottom:
-            sb.setValue(sb.maximum())
+
+    def _rerender_log(self):
+        sb = self.logw.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 4
+        pos = sb.value()
+        self.logw.setUpdatesEnabled(False)
+        self.logw.clear()
+        for line in self._log_lines:
+            self._render_line(line)
+        self.logw.setUpdatesEnabled(True)
+        sb.setValue(sb.maximum() if at_bottom else pos)
+
+    def _log_clear(self):
+        self._log_lines.clear()
+        self.logw.clear()
 
     def _log_menu(self, pos):
         def save():
@@ -1412,7 +1598,7 @@ class App(QMainWindow):
                       lambda: self._set_verbose(not self.cfg.get("log_verbose"))),
                      ("📄 Открыть файл лога", lambda: shell_open(str(LOG_PATH))),
                      ("📁 Папка логов", lambda: shell_open(str(LOG_DIR))), None,
-                     ("💾 Сохранить в файл…", save), ("🗑 Очистить окно", self.logw.clear)]
+                     ("💾 Сохранить в файл…", save), ("🗑 Очистить окно", self._log_clear)]
               ).exec(self.logw.mapToGlobal(pos))
 
     def _set_verbose(self, on: bool):
@@ -1423,7 +1609,8 @@ class App(QMainWindow):
         log.info(f"✓ Подробный лог в окне: {'вкл' if on else 'выкл'}")
 
     def _ask(self, text) -> bool:
-        return QMessageBox.question(self, APP_NAME, text) == QMessageBox.Yes
+        return QMessageBox.question(self, APP_NAME, text, QMessageBox.Yes | QMessageBox.No,
+                                    QMessageBox.No) == QMessageBox.Yes  # Enter = «Нет»
 
     def _sel_rows(self, t: QTableWidget):
         return sorted({i.row() for i in t.selectedIndexes()})
@@ -1470,13 +1657,32 @@ class App(QMainWindow):
             t.setItem(r, 0, _cell(title, tip=reg))
             t.setItem(r, 1, _cell(f))
             t.setItem(r, 2, _cell(ST_TEXT[st], ST_COLOR[st]))
-        bad = sum(1 for x in rows if x[2] != "ok")
-        self._status(f"Курсор: {'⚠ чужих файлов ' + str(bad) if bad else '✓ стандартный'}")
+        bad = sum(1 for x in rows if x[2] == "bad")
+        warn = sum(1 for x in rows if x[2] == "warn")
+        self._status("Курсор: " + (f"✗ чужих файлов {bad}" if bad else
+                                   f"⚠ файлы C:\\Windows\\Cursors: {warn}" if warn else "✓ стандартный"))
 
     def _cur_size(self, n, set_widget=False):
+        """Клики [−][+] копятся 400 мс, применяется последнее значение."""
         if set_widget:
             self.cur_size.set_value(n)
-        self.worker.run("размер курсора", cursor_size_set, n)
+        self._size_timer.start(400)
+
+    def _cur_size_apply(self):
+        if self.worker.busy:
+            return self._size_timer.start(300)
+        n = self.cur_size.val
+
+        def job():
+            try:
+                cursor_size_set(n)
+            finally:
+                ui(self._cur_size_sync)
+        self.worker.run("размер курсора", job)
+
+    def _cur_size_sync(self):
+        if not self._size_timer.isActive():  # пока пользователь щёлкает — не мешаем
+            self.cur_size.set_value(cursor_size_get())
 
     def cursor_files(self):
         if not self._ask("Вернуть оригинальные файлы курсоров из хранилища Windows (WinSxS)\n"
@@ -1568,10 +1774,13 @@ class App(QMainWindow):
         on = self.snd_toggle.isChecked()
 
         def job():
-            startup_sound_set(on)
-            log.info(f"✓ Мелодия запуска Windows {'включена' if on else 'выключена'}")
-            ui(self.sound_refresh)
-        self.worker.run("мелодия запуска", job)
+            try:
+                startup_sound_set(on)
+                log.info(f"✓ Мелодия запуска Windows {'включена' if on else 'выключена'}")
+            finally:
+                ui(self.sound_refresh)  # тумблер = реальное значение из реестра
+        if not self.worker.run("мелодия запуска", job):
+            self.snd_toggle.setChecked(not on)
 
     def _snd_menu(self, pos):
         rows = self._sel_rows(self.snd_tbl)
@@ -1694,13 +1903,15 @@ class App(QMainWindow):
     def _st_menu(self, pos):
         rows = self._sel_rows(self.st_tbl)
         items = self._st_sel()
-        reg = items[0] if items and items[0]["kind"] == "reg" else None
+        reg = items[0] if items and items[0]["kind"] in ("reg", "asetup") else None
         acts = [("⏸ Отключить", lambda: self._st_set(False)), ("▶ Включить", lambda: self._st_set(True)),
                 ("🗑 Удалить…", self._st_del), None, ("📂 Показать файл", self._st_show)]
         if reg:
             acts.append(("🔎 Открыть в regedit", lambda: open_regedit(f"{reg['root']}\\{reg['path']}")))
         if items and items[0]["kind"] == "task":
             acts.append(("🗓 Планировщик заданий", lambda: shell_open("taskschd.msc")))
+        if items and items[0]["kind"] == "svc":
+            acts.append(("⚙ Службы", lambda: shell_open("services.msc")))
         acts += [None, ("📋 Копировать строку", lambda: _copy(_table_text(self.st_tbl, rows))),
                  ("📋 Копировать всё", lambda: _copy(_table_text(self.st_tbl))),
                  ("🔎 Сканировать заново", self.startup_refresh)]
@@ -1770,8 +1981,7 @@ class App(QMainWindow):
                 except Exception as e:
                     log.error(f"✗ {ch['title']}: {e}", exc_info=True)
             log.info("⚠ Часть изменений вступит в силу после перезагрузки")
-            ui(self.reg_check)
-        self.worker.run("исправление реестра", job)
+        self.worker.run("исправление реестра", job, then=self.reg_check)
 
     def _rg_menu(self, pos):
         rows = self._sel_rows(self.rg_tbl)
@@ -1870,13 +2080,17 @@ class App(QMainWindow):
 
         def open_proc():
             if sel:
-                _c, out, _ = run_ps(f"(Get-Process -Id {int(sel[0]['pid'])}).Path")
-                show_in_explorer(out.strip())
+                def job():
+                    _c, out, _ = run_ps(f"(Get-Process -Id {int(sel[0]['pid'])}).Path")
+                    show_in_explorer(out.strip())
+                self.worker.run("папка процесса", job)
 
         def kill():
             if sel and self._ask(f"Завершить процесс {sel[0]['name']} (PID {sel[0]['pid']})?"):
-                code, out, err = run_cmd(["taskkill", "/PID", str(sel[0]["pid"]), "/F"])
-                (log.info if code == 0 else log.error)(("✓ " if code == 0 else "✗ ") + (out or err).strip())
+                def job():
+                    code, out, err = run_cmd(["taskkill", "/PID", str(sel[0]["pid"]), "/F"])
+                    (log.info if code == 0 else log.error)(("✓ " if code == 0 else "✗ ") + (out or err).strip())
+                self.worker.run("завершение процесса", job, then=self.ports_refresh)
         _menu(self, [("🧱 Заблокировать порт", lambda: self._pt_rule(True)),
                      ("🔓 Снять блок WinFix", lambda: self._pt_rule(False)), None,
                      ("📂 Папка процесса", open_proc), ("⛔ Завершить процесс…", kill), None,
@@ -1940,17 +2154,28 @@ class App(QMainWindow):
 
     def sys_restore_point(self):
         def job():
-            code, out, err = run_ps("Enable-ComputerRestore -Drive $env:SystemDrive;"
-                                    "Checkpoint-Computer -Description 'WinFix' -RestorePointType MODIFY_SETTINGS", 300)
-            (log.info if code == 0 else log.error)("✓ Точка восстановления создана" if code == 0
-                                                   else f"✗ Точка не создана: {err.strip()[:300]}")
+            if not is_admin():
+                raise PermissionError
+            code, out, err = run_ps(RESTORE_POINT_PS, 300)
+            if "RP_OK" in out:
+                log.info("✓ Точка восстановления создана")
+            else:
+                msg = (out.replace("RP_WARN", "").strip() or err.strip() or f"код {code}")[:300]
+                log.error(f"✗ Точка не создана: {msg}")
         self.worker.run("точка восстановления", job)
 
     def sys_explorer(self):
         def job():
             run_cmd(["taskkill", "/F", "/IM", "explorer.exe"])
-            time.sleep(1)
-            subprocess.Popen(["explorer.exe"], creationflags=NOWIN)
+            for _ in range(8):  # Winlogon обычно сам перезапускает оболочку (AutoRestartShell)
+                time.sleep(0.5)
+                if _explorer_running():
+                    return log.info("✓ Проводник перезапущен")
+            if is_admin():  # из процесса администратора — запуск с обычными правами
+                subprocess.Popen(["runas", "/trustlevel:0x20000", "explorer.exe"], creationflags=NOWIN)
+                time.sleep(2)
+            if not _explorer_running():
+                subprocess.Popen(["explorer.exe"], creationflags=NOWIN)
             log.info("✓ Проводник перезапущен")
         self.worker.run("перезапуск проводника", job)
 
@@ -1990,10 +2215,22 @@ class App(QMainWindow):
         name = name if name in _QT_THEMES else "dark"
         self.cfg["theme"] = name
         p = _QT_THEMES[name]
-        QApplication.instance().setStyleSheet(_qss(p))
+        _set_status_colors(p)
+        app = QApplication.instance()
+        app.setPalette(_palette(p))
+        app.setStyleSheet(_qss(p))
         Toggle.set_theme(p["accent"], "#454b59" if name == "dark" else "#c3c8d2", p["text"])
         for w in self.findChildren(Toggle):
             w.update()
+        if getattr(self, "_themed", False):  # перекрасить уже выведенное под новую тему
+            self._rerender_log()
+            self.cursor_refresh()
+            self.sound_refresh()
+            self._st_fill()
+            self._pt_fill()
+            if self.check_res:
+                self._rg_fill(self.check_res)
+        self._themed = True
 
     def _cfg_snapshot(self):
         self.cfg["geometry"] = bytes(self.saveGeometry().toBase64()).decode()
@@ -2001,6 +2238,9 @@ class App(QMainWindow):
         return self.cfg
 
     def closeEvent(self, e):
+        if self.worker.busy and not self._ask("Ещё выполняется действие (" + self.pill.text().strip("● …")
+                                              + ").\nПрервать и закрыть программу?"):
+            return e.ignore()
         save_config(self._cfg_snapshot())
         log.debug("выход")
         super().closeEvent(e)
@@ -2016,6 +2256,17 @@ def selftest() -> int:
             assert callable(fn)
         assert len(build_checks()) > 10
         lines.append("логика: ok")
+        app = QApplication.instance() or QApplication(sys.argv[:1])
+        w = App()
+        for theme in ("light", "dark"):
+            w._apply_theme(theme)
+            log.info(f"✓ selftest {theme}")
+            w._drain_log()
+        assert w.logw.document().blockCount() >= 2
+        w.timer.stop()
+        w.deleteLater()  # без closeEvent — config.json не трогаем
+        app.processEvents()
+        lines.append("окно и темы: ok")
     except Exception as e:
         ok = False
         lines.append(f"ОШИБКА: {e}")
