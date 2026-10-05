@@ -1,9 +1,15 @@
 r"""
-win_fix.py  v1.4.0
+win_fix.py  v1.5.0
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.5.0: 🗑 Программы — список установленных (HKLM/HKCU, 32/64), запуск деинсталлятора (MSI: /X) с ожиданием,
+        поиск остатков: папка установки, Program Files/ProgramData/AppData (+ папка издателя), ярлыки,
+        ключи реестра (+ ключ издателя), запись «Программы и компоненты», автозагрузка, службы и задачи из
+        папки программы; ✗ точно / ⚠ похоже; системные папки и ключи (Microsoft, Common Files…) защищены;
+        файлы — в backup\uninstall (↩ Откат вернёт), «Очистить backup\uninstall» освобождает место.
+        Ряды кнопок переносятся на узком окне — без горизонтальной прокрутки (FlowLayout).
 v1.4.0: ↩ Откат — каждое действие пишет старые значения (реестр, ключи целиком, файлы, ярлыки, задачи, DNS,
         исключения Defender) в backup/undo_*.json, откат одной кнопкой; 🪄 «Исправить всё» (точка → курсор →
         звуки → реестр ✗ → важные службы ✗); 📄 отчёт по всем проверкам (reports/*.txt); новые страницы:
@@ -74,7 +80,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -131,12 +137,12 @@ def ensure_packages() -> None:
 
 ensure_packages()
 
-from PySide6.QtCore import QByteArray, QRectF, QSize, Qt, QTimer, Signal  # noqa: E402
+from PySide6.QtCore import QByteArray, QItemSelectionModel, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal  # noqa: E402
 from PySide6.QtGui import (QAction, QColor, QFont, QGuiApplication, QPainter,  # noqa: E402
                            QPalette, QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication,  # noqa: E402
                                QButtonGroup, QFileDialog, QFrame, QHBoxLayout,
-                               QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
+                               QHeaderView, QLabel, QLayout, QLineEdit, QMainWindow, QMenu,
                                QMessageBox, QPlainTextEdit, QPushButton, QSplitter,
                                QScrollArea, QStackedWidget, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
@@ -1801,6 +1807,240 @@ def fix_all(checks) -> None:
     log.info("✅ Готово. Откатить всё разом — страница ↩ Откат. Часть изменений — после перезагрузки.")
 
 
+# ───────────────────────── удаление программ ─────────────────────────
+UNINST_KEYS = [("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+               ("HKLM", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+               ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Uninstall")]
+# папки/ключи, которые никогда не предлагаются к удалению целиком
+PROTECT = {"microsoft", "windows", "commonfiles", "windowsapps", "packages", "temp", "programs", "microsoftnet",
+           "windowsdefender", "windowspowershell", "internetexplorer", "windowsnt", "classes", "policies",
+           "wow6432node", "clients", "registeredapplications", "intel", "nvidia", "nvidiacorporation", "amd", "google",
+           "mozilla", "oracle", "java", "python", "packagecache", "installer", "systemprofile", "start menu",
+           "startmenu", "desktop", "documents", "default", "public", "users", "appdata", "local", "roaming",
+           "locallow", "crashdumps", "d3dscache", "connecteddevicesplatform", "comms", "history", "inetcache"}
+NAME_STOP = {"the", "for", "and", "x64", "x86", "bit", "64bit", "32bit", "version", "edition", "setup", "update",
+             "версия", "free", "pro", "app", "application", "programs", "program", "software", "tools", "tool"}
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^0-9a-zа-яё+#]", "", (s or "").lower())
+
+
+def _app_key(name: str) -> str:
+    """«Notepad++ (64-bit x64) 8.6.2» → «notepad++»."""
+    s = re.sub(r"\(.*?\)|\bv?\d+(\.\d+)+\b|\b(x64|x86|64-bit|32-bit|64 bit|32 bit)\b", " ", name or "", flags=re.I)
+    return _norm(s)
+
+
+def _words(name: str) -> list:
+    return [w for w in re.findall(r"[0-9a-zа-яё+#]{4,}", (name or "").lower()) if w not in NAME_STOP]
+
+
+def uninstall_list() -> list:
+    out, seen = [], set()
+    for root, base in UNINST_KEYS:
+        for sub in reg_subkeys(root, base):
+            k = rf"{base}\{sub}"
+            g = lambda n: reg_get(root, k, n)  # noqa: E731
+            name = g("DisplayName")
+            if not name or g("SystemComponent") == 1 or g("ParentKeyName") or \
+                    str(g("ReleaseType") or "").lower() in ("update", "hotfix", "security update"):
+                continue
+            ident = (str(name).lower(), str(g("DisplayVersion") or ""))
+            if ident in seen:
+                continue
+            seen.add(ident)
+            date = str(g("InstallDate") or "")
+            out.append(dict(name=str(name), ver=str(g("DisplayVersion") or ""), pub=str(g("Publisher") or ""),
+                            loc=str(g("InstallLocation") or "").strip().strip('"').rstrip("\\"),
+                            cmd=str(g("UninstallString") or ""), quiet=str(g("QuietUninstallString") or ""),
+                            icon=str(g("DisplayIcon") or ""), size=int(g("EstimatedSize") or 0) // 1024,
+                            date=f"{date[:4]}-{date[4:6]}-{date[6:8]}" if re.fullmatch(r"\d{8}", date) else "",
+                            root=root, key=k, src="пользователь" if root == "HKCU" else
+                            ("32-бит" if "WOW6432" in base else "все")))
+    out.sort(key=lambda a: a["name"].lower())
+    return out
+
+
+def _install_dir(app: dict) -> str:
+    """Папка программы: InstallLocation, иначе папка деинсталлятора/иконки (если это не корень Program Files)."""
+    cands = [app["loc"], os.path.dirname(exe_from_cmd(app["cmd"])), os.path.dirname(exe_from_cmd(app["icon"].split(",")[0]))]
+    for c in cands:
+        c = (c or "").rstrip("\\")
+        if c and os.path.isdir(c) and _norm(os.path.basename(c)) not in PROTECT and len(Path(c).parts) >= 3 \
+                and "\\windows\\" not in c.lower() + "\\" and "msiexec" not in c.lower():
+            return c
+    return ""
+
+
+def uninstall_run(app: dict, quiet: bool = False) -> None:
+    """Запустить деинсталлятор программы и дождаться, пока её запись исчезнет из реестра."""
+    cmd = (app["quiet"] if quiet and app["quiet"] else app["cmd"]).strip()
+    if not cmd:
+        raise RuntimeError("у программы нет деинсталлятора — используйте «🔎 Найти остатки»")
+    if re.search(r"msiexec", cmd, re.I):
+        cmd = re.sub(r"(?i)/I\s*(\{)", r"/X\1", cmd)
+    log.info(f"⏳ Деинсталлятор: {cmd}")
+    p = subprocess.Popen(cmd if IS_WIN else cmd.split())
+    p.wait()
+    log.debug(f"деинсталлятор завершён, код {p.returncode}")
+    for _ in range(90):  # Inno/NSIS перезапускают себя из TEMP — ждём исчезновения записи до 3 мин
+        if not reg_key_exists(app["root"], app["key"]):
+            return log.info(f"✓ {app['name']}: удалена деинсталлятором")
+        time.sleep(2)
+    log.warning(f"⚠ {app['name']}: запись в реестре осталась (деинсталлятор отменён или не до конца)")
+
+
+def _dir_size(path: str, limit: float = 3.0) -> int:
+    total, t0 = 0, time.time()
+    for r, _d, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(r, f))
+            except OSError:
+                pass
+        if time.time() - t0 > limit:
+            break
+    return total
+
+
+def _human(n: int) -> str:
+    for u in ("Б", "КБ", "МБ", "ГБ"):
+        if n < 1024:
+            return f"{n:.0f} {u}"
+        n /= 1024
+    return f"{n:.1f} ТБ"
+
+
+def leftovers_scan(app: dict) -> list:
+    """Остатки программы. st: bad — точно её (совпадение имени/папки), warn — похоже, проверьте."""
+    key, words, pub = _app_key(app["name"]), _words(app["name"]), _norm(app["pub"])
+    inst = _install_dir(app)
+    items, seen = [], set()
+
+    def add(kind, path, st, why, **kw):
+        if path.lower() in seen:
+            return
+        seen.add(path.lower())
+        items.append(dict(kind=kind, path=path, st=st, why=why, **kw))
+
+    def match(name: str) -> str:
+        n = _norm(name)
+        if not n or n in PROTECT or n == pub:
+            return ""
+        if n == key or (len(key) >= 5 and (n.startswith(key) or (len(n) >= 5 and key.startswith(n)))):
+            return "bad"
+        if words and len(words[0]) >= 5 and n == _norm(words[0]):
+            return "warn"
+        return ""
+
+    if inst:
+        add("dir", inst, "bad", "папка установки")
+    env = os.environ.get
+    bases = [env("ProgramFiles", r"C:\Program Files"), env("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+             env("ProgramData", r"C:\ProgramData"), env("APPDATA", ""), env("LOCALAPPDATA", ""),
+             os.path.join(env("LOCALAPPDATA", ""), "Programs"), os.path.join(env("USERPROFILE", ""), "AppData", "LocalLow"),
+             os.path.join(env("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs"),
+             os.path.join(env("ProgramData", ""), r"Microsoft\Windows\Start Menu\Programs")]
+    for b in bases:
+        if not b or not os.path.isdir(b):
+            continue
+        try:
+            children = list(os.scandir(b))
+        except OSError:
+            continue
+        for e in children:
+            st = match(e.name)
+            if st:
+                add("dir" if e.is_dir() else "file", e.path, st, "имя совпадает")
+            elif e.is_dir() and pub and _norm(e.name) == pub:  # Издатель\Программа
+                try:
+                    subs = list(os.scandir(e.path))
+                except OSError:
+                    continue
+                hits = [s for s in subs if match(s.name)]
+                for s in hits:
+                    add("dir" if s.is_dir() else "file", s.path, match(s.name), "папка издателя → программа")
+                if (hits and len(hits) == len(subs)) or not subs:
+                    add("dir", e.path, "warn", "папка издателя (пустая без программы)")
+    # ярлыки на рабочих столах
+    for d in (os.path.join(env("USERPROFILE", ""), "Desktop"), os.path.join(env("PUBLIC", ""), "Desktop")):
+        if os.path.isdir(d):
+            for e in os.scandir(d):
+                if e.name.lower().endswith(".lnk") and match(e.name[:-4]):
+                    add("file", e.path, "warn", "ярлык")
+    # реестр
+    for root, base in (("HKCU", "Software"), ("HKLM", "SOFTWARE"), ("HKLM", r"SOFTWARE\WOW6432Node")):
+        for sub in reg_subkeys(root, base):
+            st = match(sub)
+            if st:
+                add("reg", rf"{root}\{base}\{sub}", st, "ключ программы", root=root, rpath=rf"{base}\{sub}")
+            elif pub and _norm(sub) == pub:
+                subs = reg_subkeys(root, rf"{base}\{sub}")
+                hits = [s for s in subs if match(s)]
+                for s in hits:
+                    add("reg", rf"{root}\{base}\{sub}\{s}", match(s), "ключ издателя → программа", root=root,
+                        rpath=rf"{base}\{sub}\{s}")
+                if (hits and len(hits) == len(subs)) or not (subs or reg_values(root, rf"{base}\{sub}")):
+                    add("reg", rf"{root}\{base}\{sub}", "warn", "ключ издателя (пустой без программы)", root=root,
+                        rpath=rf"{base}\{sub}")
+    if reg_key_exists(app["root"], app["key"]):
+        add("reg", rf"{app['root']}\{app['key']}", "warn", "запись «Программы и компоненты»", root=app["root"],
+            rpath=app["key"])
+    # автозагрузка, службы, задачи — по папке установки
+    if inst and IS_WIN:
+        il = inst.lower()
+        for root, path, _appr in RUN_KEYS:
+            for n, v, _t in reg_values(root, path):
+                if n and il in os.path.expandvars(str(v)).lower():
+                    add("regval", rf"{root}\{path}\{n}", "bad", "автозагрузка", root=root, rpath=path, rname=n)
+        _c, out, _ = run_ps(
+            f"$p={ps_quote(il)};@(Get-CimInstance Win32_Service | ?{{ $_.PathName -and $_.PathName.ToLower().Contains($p) }} |"
+            " %{[pscustomobject]@{k='svc';n=$_.Name;v=$_.PathName}}) + @(Get-ScheduledTask | ?{ (($_.Actions | "
+            "%{ $_.Execute + ' ' + $_.Arguments }) -join ' ').ToLower().Contains($p) } | "
+            "%{[pscustomobject]@{k='task';n=$_.TaskName;p=$_.TaskPath;v=(($_.Actions|%{$_.Execute}) -join ' ; ')}}) "
+            "| ConvertTo-Json -Compress", timeout=120)
+        try:
+            res = json.loads(out or "[]")
+            for r in [res] if isinstance(res, dict) else res:
+                if r["k"] == "svc":
+                    add("svc", f"служба {r['n']}", "bad", r["v"], name=r["n"])
+                else:
+                    add("task", f"задача {r.get('p', '')}{r['n']}", "bad", r["v"], name=r["n"], tpath=r.get("p", "\\"))
+        except Exception:
+            log.debug("службы/задачи программы не прочитаны", exc_info=True)
+    for it in items:
+        it["size"] = _human(_dir_size(it["path"])) if it["kind"] == "dir" else \
+            (_human(os.path.getsize(it["path"])) if it["kind"] == "file" and os.path.exists(it["path"]) else "")
+    items.sort(key=lambda i: (i["st"] != "bad", i["kind"], i["path"].lower()))
+    return items
+
+
+def leftover_delete(it: dict, app_name: str) -> None:
+    """Файлы и папки переносятся в backup\\uninstall (откат вернёт), ключи реестра — с копией в журнале."""
+    k = it["kind"]
+    if k in ("dir", "file"):
+        dst = BACKUP_DIR / "uninstall" / (_norm(app_name)[:40] or "app")
+        dst.mkdir(parents=True, exist_ok=True)
+        move_journaled(it["path"], _unique(dst / Path(it["path"]).name))
+    elif k == "reg":
+        reg_delete_tree(it["root"], it["rpath"])
+    elif k == "regval":
+        reg_del(it["root"], it["rpath"], it["rname"])
+    elif k == "svc":
+        run_ps(f"Stop-Service -Name {ps_quote(it['name'])} -Force -ErrorAction SilentlyContinue")
+        svc_start_set(it["name"], 4)
+        code, out, err = run_cmd(["sc", "delete", it["name"]])
+        if code:
+            raise RuntimeError((out or err).strip() or "служба не удалена")
+    elif k == "task":
+        task_delete(it["tpath"], it["name"])
+
+
+def backup_size() -> int:
+    return _dir_size(str(BACKUP_DIR / "uninstall"), 5) if (BACKUP_DIR / "uninstall").is_dir() else 0
+
+
 # ───────────────────────── Worker ─────────────────────────
 class Worker:
     def __init__(self):
@@ -2053,13 +2293,70 @@ def _card(title):
     return fr, lay
 
 
+class FlowLayout(QLayout):
+    """Ряд виджетов с переносом на следующую строку, если не помещаются по ширине."""
+
+    def __init__(self, parent=None, spacing=8):
+        super().__init__(parent)
+        self._items = []
+        self.setSpacing(spacing)
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        return self._do_layout(QRect(0, 0, w, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for it in self._items:
+            size = size.expandedTo(it.minimumSize())
+        return size
+
+    def _do_layout(self, rect, test):
+        x, y, line_h, sp = rect.x(), rect.y(), 0, self.spacing()
+        for it in self._items:
+            if it.widget() and not it.widget().isVisibleTo(it.widget().parentWidget() or it.widget()):
+                continue
+            hint = it.sizeHint()
+            if x + hint.width() > rect.right() + 1 and line_h > 0:
+                x, y, line_h = rect.x(), y + line_h + sp, 0
+            if not test:
+                it.setGeometry(QRect(QPoint(x, y + (line_h - hint.height()) // 2 if line_h > hint.height() else y),
+                                     hint))
+            x += hint.width() + sp
+            line_h = max(line_h, hint.height())
+        return y + line_h - rect.y()
+
+
 def _row(*widgets, stretch=True):
-    h = QHBoxLayout()
-    h.setSpacing(8)
+    """Ряд кнопок: переносится на новую строку на узком окне (без горизонтальной прокрутки)."""
+    h = FlowLayout()
     for w in widgets:
         h.addWidget(w)
-    if stretch:
-        h.addStretch(1)
     return h
 
 
@@ -2119,7 +2416,8 @@ def _copy(text):
 # ───────────────────────── окно ─────────────────────────
 class App(QMainWindow):
     PAGES = [("🖱", "Курсор", "Курсор"), ("🔊", "Звуки", "Звуки входа"),
-             ("🚀", "Автозагрузка", "Автозагрузка (музыка при входе)"), ("🩺", "Реестр", "Проверка реестра"),
+             ("🚀", "Автозагрузка", "Автозагрузка (музыка при входе)"),
+             ("🗑", "Программы", "Удаление программ и их остатков"), ("🩺", "Реестр", "Проверка реестра"),
              ("⚙", "Службы", "Службы Windows"), ("🧭", "Браузеры", "Браузеры и ярлыки"),
              ("📋", "Меню", "Контекстное меню Проводника"), ("🏴", "Активаторы", "Следы активаторов"),
              ("🌐", "Сеть", "Сеть и DNS"), ("🔌", "Порты", "Порты"), ("🛠", "Система", "Система и инструменты"),
@@ -2175,7 +2473,7 @@ class App(QMainWindow):
         self.nav = QButtonGroup(self)
         self.nav_btns = []
         self.stack = QStackedWidget()
-        builders = [self._page_cursor, self._page_sound, self._page_startup, self._page_registry,
+        builders = [self._page_cursor, self._page_sound, self._page_startup, self._page_uninstall, self._page_registry,
                     self._page_services, self._page_browsers, self._page_ctx, self._page_kms, self._page_net,
                     self._page_ports, self._page_system, self._page_undo, self._page_theme]
         for i, ((emo, short, tip), build) in enumerate(zip(self.PAGES, builders)):
@@ -2202,6 +2500,7 @@ class App(QMainWindow):
             sc = QScrollArea()  # маленький экран — страница прокручивается, а не сжимается
             sc.setObjectName("pagescroll")
             sc.setWidgetResizable(True)
+            sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             sc.setFrameShape(QFrame.NoFrame)
             sc.setWidget(page)
             page.setMinimumHeight(420)
@@ -3439,6 +3738,172 @@ class App(QMainWindow):
                 log.info(f"✓ У вас последняя версия ({VERSION})")
         self.worker.run("проверка обновлений", job, journal=False)
 
+    # ── 🗑 удаление программ ──
+    def _page_uninstall(self, pl):
+        c, cl = _card("Установленные программы")
+        self.ap_filter = QLineEdit()
+        self.ap_filter.setPlaceholderText("🔎 Фильтр: название, издатель…")
+        self.ap_filter.textChanged.connect(self._ap_fill)
+        cl.addWidget(self.ap_filter)
+        self.ap_tbl = _table(["Программа", "Версия", "Издатель", "МБ", "Дата", "Для"], 0)
+        self.ap_tbl.customContextMenuRequested.connect(self._ap_menu)
+        self.ap_tbl.itemDoubleClicked.connect(lambda *_: self._ap_uninstall())
+        cl.addWidget(self.ap_tbl, 1)
+        b1 = self._scan_btn("🔄 Список", "Программы из реестра (как в «Программах и компонентах»)", self.apps_refresh)
+        b2 = _btn("🗑 Удалить программу", "danger", "Деинсталлятор программы → поиск остатков", self._ap_uninstall)
+        b3 = _btn("🔎 Найти остатки", "", "Без деинсталлятора — если программа уже удалена или сломана",
+                  self._ap_leftovers)
+        self.busy_btns += [b2, b3]
+        cl.addLayout(_row(b1, b2, b3, _btn("📦 Программы и компоненты", "chip", "appwiz.cpl",
+                                           lambda: shell_open("appwiz.cpl"))))
+        pl.addWidget(c, 3)
+
+        c, cl = _card("Остатки")
+        self.lo_title = _lab("Выберите программу и нажмите «🗑 Удалить программу» или «🔎 Найти остатки».", "hint")
+        cl.addWidget(self.lo_title)
+        self.lo_tbl = _table(["Статус", "Тип", "Где", "Размер", "Почему"], 2)
+        self.lo_tbl.customContextMenuRequested.connect(self._lo_menu)
+        cl.addWidget(self.lo_tbl, 1)
+        b4 = _btn("🧹 Удалить выбранные остатки", "primary", "Файлы → backup\\uninstall, реестр — с копией (↩ Откат)",
+                  self._lo_delete)
+        self.busy_btns.append(b4)
+        cl.addLayout(_row(b4, _btn("✓ Выделить надёжные", "", "Только ✗ — точно этой программы", self._lo_select_sure),
+                          _btn("🗑 Очистить backup\\uninstall", "danger", "Удалить навсегда перенесённые файлы",
+                               self._lo_purge)))
+        cl.addWidget(_lab("✗ — точно этой программы (папка установки, совпадает имя). ⚠ — похоже, проверьте перед "
+                          "удалением. Файлы не стираются, а переносятся в backup\\uninstall — откат вернёт их; "
+                          "место освобождает «Очистить backup\\uninstall».", "hint"))
+        pl.addWidget(c, 2)
+        self.ap_items: list = []
+        self.lo_items: list = []
+        self.lo_app: dict | None = None
+
+    def apps_refresh(self):
+        self._scan_into("Программы", uninstall_list, "ap_items", self._ap_fill)
+
+    def _ap_fill(self):
+        q = self.ap_filter.text().lower().strip()
+        vis = [a for a in self.ap_items if not q or q in (a["name"] + " " + a["pub"]).lower()]
+        t = self.ap_tbl
+        t.setSortingEnabled(False)
+        t.setRowCount(len(vis))
+        for i, a in enumerate(vis):
+            t.setItem(i, 0, _cell(a["name"], tip=a["cmd"] or "нет деинсталлятора"))
+            t.setItem(i, 1, _cell(a["ver"]))
+            t.setItem(i, 2, _cell(a["pub"]))
+            sz = _cell("")
+            if a["size"]:
+                sz.setData(Qt.DisplayRole, a["size"])  # число — сортировка по размеру
+            t.setItem(i, 3, sz)
+            t.setItem(i, 4, _cell(a["date"]))
+            t.setItem(i, 5, _cell(a["src"], tip=f"{a['root']}\\{a['key']}"))
+            t.item(i, 0).setData(Qt.UserRole, a)
+        t.setSortingEnabled(True)
+        self._status(f"Программ: {len(vis)} из {len(self.ap_items)}")
+
+    def _ap_sel(self):
+        sel = self._sel_data(self.ap_tbl)
+        if not sel:
+            log.warning("⚠ Выберите программу")
+        return sel[0] if sel else None
+
+    def _ap_uninstall(self, quiet=False):
+        a = self._ap_sel()
+        if not a or not self._ask(f"Удалить «{a['name']}» {a['ver']}?\n\n1. Запустится её деинсталлятор — пройдите "
+                                  "его до конца.\n2. Затем WinFix найдёт остатки (папки, реестр, ярлыки, службы, "
+                                  "задачи) — вы выберете, что удалить."):
+            return
+
+        def job():
+            uninstall_run(a, quiet)
+            self._lo_scan_job(a)
+        self.worker.run(f"удаление {a['name']}", job, then=self.apps_refresh, journal=False)
+
+    def _ap_leftovers(self):
+        a = self._ap_sel()
+        if a:
+            self.worker.run(f"остатки {a['name']}", self._lo_scan_job, a, journal=False)
+
+    def _lo_scan_job(self, a):
+        log.info(f"⏳ Ищу остатки «{a['name']}»…")
+        items = leftovers_scan(a)
+        sure = sum(1 for i in items if i["st"] == "bad")
+        log.info(f"{'⚠' if items else '✓'} Остатки «{a['name']}»: {len(items)}" + (f" (✗ точно: {sure})" if sure else ""))
+        ui(lambda: self._lo_show(a, items))
+
+    def _lo_show(self, a, items):
+        self.lo_app, self.lo_items = a, items
+        self.lo_title.setText(f"Остатки: {a['name']} {a['ver']} — найдено {len(items)}")
+        self._lo_fill()
+        self._lo_select_sure()
+
+    def _lo_fill(self):
+        t = self.lo_tbl
+        t.setRowCount(len(self.lo_items))
+        kinds = {"dir": "📁 папка", "file": "📄 файл", "reg": "🧬 реестр", "regval": "🚀 автозагрузка",
+                 "svc": "⚙ служба", "task": "🗓 задача"}
+        for i, it in enumerate(self.lo_items):
+            t.setItem(i, 0, _cell("✗ точно" if it["st"] == "bad" else "⚠ похоже", ST_COLOR[it["st"]]))
+            t.setItem(i, 1, _cell(kinds.get(it["kind"], it["kind"])))
+            t.setItem(i, 2, _cell(it["path"]))
+            t.setItem(i, 3, _cell(it.get("size", "")))
+            t.setItem(i, 4, _cell(it["why"]))
+            t.item(i, 0).setData(Qt.UserRole, it)
+
+    def _lo_select_sure(self):
+        t = self.lo_tbl
+        t.clearSelection()
+        for i, it in enumerate(self.lo_items):
+            if it["st"] == "bad":
+                t.selectionModel().select(t.model().index(i, 0), QItemSelectionModel.Select | QItemSelectionModel.Rows)
+
+    def _lo_delete(self):
+        sel = self._sel_data(self.lo_tbl)
+        name = self.lo_app["name"] if self.lo_app else "app"
+        if not sel:
+            return log.warning("⚠ Выберите остатки")
+        warn = sum(1 for i in sel if i["st"] != "bad")
+        self._apply_items(f"Остаток {name}", [dict(i, title=i["path"]) for i in sel],
+                          lambda it: leftover_delete(it, name), self._lo_after,
+                          f"Удалить остатки «{name}» ({len(sel)})?" + (f"\n⚠ Среди них «похожих»: {warn}" if warn else ""))
+
+    def _lo_after(self):
+        if self.lo_app:
+            self.worker.run(f"остатки {self.lo_app['name']}", self._lo_scan_job, self.lo_app, journal=False)
+
+    def _lo_purge(self):
+        d = BACKUP_DIR / "uninstall"
+        if not d.is_dir():
+            return log.info("✓ backup\\uninstall пуст")
+        if self._ask(f"Удалить НАВСЕГДА перенесённые файлы ({_human(backup_size())})?\nОткатить их будет нельзя."):
+            self.worker.run("очистка backup", lambda: (shutil.rmtree(d, ignore_errors=True),
+                                                       log.info("✓ backup\\uninstall очищен")), journal=False)
+
+    def _ap_menu(self, pos):
+        sel = self._sel_data(self.ap_tbl)
+        a = sel[0] if sel else None
+        acts = [("🗑 Удалить программу…", self._ap_uninstall)]
+        if a and a["quiet"]:
+            acts.append(("🤫 Удалить тихо (без окон)…", lambda: self._ap_uninstall(True)))
+        self._std_menu(self.ap_tbl, pos, acts + [
+            ("🔎 Найти остатки", self._ap_leftovers), None,
+            ("📂 Папка программы", lambda: a and (_install_dir(a) and shell_open(_install_dir(a))
+                                                 or log.warning("⚠ Папка программы не найдена"))),
+            ("🔎 Открыть в regedit", lambda: a and open_regedit(f"{a['root']}\\{a['key']}")),
+            ("🌐 Найти в интернете", lambda: a and webbrowser.open(
+                "https://www.google.com/search?q=" + re.sub(r"\s+", "+", a["name"]))),
+            ("🔄 Обновить список", self.apps_refresh)])
+
+    def _lo_menu(self, pos):
+        sel = self._sel_data(self.lo_tbl)
+        it = sel[0] if sel else None
+        acts = [("🧹 Удалить выбранные…", self._lo_delete), ("✓ Выделить надёжные", self._lo_select_sure), None]
+        if it and it["kind"] in ("dir", "file"):
+            acts.append(("📂 Открыть", lambda: shell_open(it["path"] if it["kind"] == "dir" else os.path.dirname(it["path"]))))
+        if it and it["kind"] in ("reg", "regval"):
+            acts.append(("🔎 Открыть в regedit", lambda: open_regedit(f"{it['root']}\\{it['rpath']}")))
+        self._std_menu(self.lo_tbl, pos, acts)
+
     # ── 🎨 тема ──
     def _page_theme(self, pl):
         c, cl = _card("Тема")
@@ -3484,7 +3949,8 @@ class App(QMainWindow):
             self.sound_refresh()
             self._st_fill()
             self._pt_fill()
-            for fill in (self._sv_fill, self._br_fill, self._cx_fill, self._km_fill, self._dn_fill):
+            for fill in (self._sv_fill, self._br_fill, self._cx_fill, self._km_fill, self._dn_fill, self._ap_fill,
+                         self._lo_fill):
                 fill()
             if self.check_res:
                 self._rg_fill(self.check_res)
