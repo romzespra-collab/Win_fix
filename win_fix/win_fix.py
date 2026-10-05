@@ -1,9 +1,13 @@
 r"""
-win_fix.py  v1.6.1
+win_fix.py  v1.6.2
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.6.2: чистка реестра: переключатель «⚠ Неподключённые диски — тоже мусор» (как CCleaner, запоминается);
+        удаление ключа снимает запрет Deny (UserChoice у расширений) и пробует снова;
+        «пустой класс» — ещё и классы только с описанием (без shell/CLSID/иконки), если на них не ссылается
+        ни одно расширение (напр. Intel.GraphicsControlPanel.igp.1).
 v1.6.1: ИСПРАВЛЕНО: удаление ключей реестра целиком не работало в Windows (RegDeleteTreeW через ctypes падал
         на 64-битном Python) — теперь рекурсивно через winreg; затрагивало чистку реестра (расширения, пустые
         ключи), меню Проводника, политики браузеров, остатки программ, ассоциацию .exe.
@@ -91,7 +95,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -564,6 +568,15 @@ def reg_delete_tree(root, path) -> None:
             wr.DeleteKeyEx(HK[root], p, W64, 0)
         except FileNotFoundError:
             pass
+        except PermissionError:
+            if not IS_WIN:
+                raise
+            # UserChoice и т.п.: Windows ставит запрет (Deny) — снимаем его и пробуем ещё раз
+            rp = ps_quote(f"Registry::{HK_FULL[root]}\\{p}")
+            run_ps(f"$a=Get-Acl -LiteralPath {rp};$a.Access|?{{$_.AccessControlType -eq 'Deny'}}|"
+                   f"%{{[void]$a.RemoveAccessRule($_)}};Set-Acl -LiteralPath {rp} -AclObject $a")
+            log.debug(f"снят запрет Deny: {root}\\{p}")
+            wr.DeleteKeyEx(HK[root], p, W64, 0)
     rm(path)
     if reg_key_exists(root, path):
         raise RuntimeError("ключ не удалён (нет прав?)")
@@ -2130,12 +2143,20 @@ def regclean_scan(cats=None) -> list:
             if ext == "." or (ext.startswith(".") and not _ext_used(ext)):  # DDECache, OpenWithList — служебные
                 add("fileexts", ext, "HKCU", rf"{FILEEXTS}\{ext}", "tree")
     if "badclass" in cats:
-        for k in reg_subkeys("HKCR", ""):
+        keys = reg_subkeys("HKCR", "")
+        used = set()  # на какие классы ссылаются расширения
+        for k in keys:
             if k.startswith("."):
                 prog = reg_get("HKCR", k, "")
-                if isinstance(prog, str) and prog.strip() and not reg_key_exists("HKCR", prog):
-                    add("badclass", f"{k} → {prog}", "HKCR", k, "defval")
-            elif "." in k and not k.startswith(("*", "{")) and not reg_values("HKCR", k) and not reg_subkeys("HKCR", k):
+                if isinstance(prog, str) and prog.strip():
+                    used.add(prog.lower())
+                    if not reg_key_exists("HKCR", prog):
+                        add("badclass", f"{k} → {prog}", "HKCR", k, "defval")
+                used.update(n.lower() for n, _v, _t in reg_values("HKCR", rf"{k}\OpenWithProgids"))
+        for k in keys:
+            if "." in k and not k.startswith((".", "*", "{")) and k.lower() not in used \
+                    and not reg_subkeys("HKCR", k) \
+                    and {n.lower() for n, _v, _t in reg_values("HKCR", k)} <= {"", "friendlytypename", "editflags", "infotip"}:
                 add("badclass", k, "HKCR", k, "tree")
     if "apppaths" in cats:
         for root in ("HKCU", "HKLM"):
@@ -4108,6 +4129,11 @@ class App(QMainWindow):
             self.rc_cats[key] = t
             tg.append(t)
         cl.addLayout(_row(*tg))
+        self.rc_nodrive = Toggle("⚠ Неподключённые диски (флешка, сеть) — тоже мусор")
+        self.rc_nodrive.setToolTip("Как CCleaner: отмечать записи о файлах на дисках, которых сейчас нет")
+        self.rc_nodrive.setChecked(bool(self.cfg.get("rc_nodrive")))
+        self.rc_nodrive.clicked.connect(self._rc_nodrive)
+        cl.addWidget(self.rc_nodrive)
         pl.addWidget(c)
         c, cl = _card("Проблемы реестра")
         self.rc_info = _lab("Нажмите «🔎 Сканировать».", "hint")
@@ -4122,7 +4148,7 @@ class App(QMainWindow):
         cl.addLayout(_row(b1, b2, _btn("☑ Отметить всё", "", "", lambda: self._rc_check_all(True)),
                           _btn("☐ Снять всё", "", "", lambda: self._rc_check_all(False))))
         cl.addWidget(_lab("Отмечены только надёжные находки. ⚠ — файл на диске, который сейчас не подключён "
-                          "(флешка, сетевой диск): не отмечается — подключите диск или решите сами. "
+                          "(флешка, сетевой диск): не отмечается — подключите диск или включите переключатель выше. "
                           "Копия .reg не нужна: всё удалённое возвращает ↩ Откат.", "hint"))
         pl.addWidget(c, 1)
         self.rc_items: list = []
@@ -4141,13 +4167,23 @@ class App(QMainWindow):
         for i, it in enumerate(self.rc_items):
             chk = _cell("", tip=it["note"] or "")
             chk.setFlags(chk.flags() | Qt.ItemIsUserCheckable)
-            chk.setCheckState(Qt.Checked if it["st"] == "bad" else Qt.Unchecked)
+            chk.setCheckState(Qt.Checked if it["st"] == "bad" or self.rc_nodrive.isChecked() else Qt.Unchecked)
             chk.setData(Qt.UserRole, it)
             t.setItem(i, 0, chk)
             t.setItem(i, 1, _cell(("⚠ " if it["st"] == "warn" else "") + it["title"],
                                   _WARN if it["st"] == "warn" else None, tip=it["note"] or it["title"]))
             t.setItem(i, 2, _cell(it["data"]))
             t.setItem(i, 3, _cell(it["key"]))
+        t.blockSignals(False)
+        self._rc_count()
+
+    def _rc_nodrive(self):
+        self.cfg["rc_nodrive"] = self.rc_nodrive.isChecked()
+        t = self.rc_tbl
+        t.blockSignals(True)
+        for r in range(t.rowCount()):
+            if t.item(r, 0).data(Qt.UserRole)["st"] == "warn":
+                t.item(r, 0).setCheckState(Qt.Checked if self.rc_nodrive.isChecked() else Qt.Unchecked)
         t.blockSignals(False)
         self._rc_count()
 
