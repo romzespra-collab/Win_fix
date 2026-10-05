@@ -1,9 +1,13 @@
 r"""
-win_fix.py  v1.3.3
+win_fix.py  v1.3.4
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.3.4: курсор: подмена файлов определяется сверкой SHA256 с оригиналом из WinSxS, а не только по владельцу —
+        оригиналы, восстановленные прошлой версией (владелец «Администраторы»), больше не считаются подменой;
+        файлы C:\Windows\Cursors (в т.ч. не aero_*) — ✓, если совпадают с оригиналом; сверка при запуске в фоне;
+        «🧩 Восстановить файлы» возвращает владельца TrustedInstaller и уже оригинальным файлам.
 v1.3.3: исправления по полному анализу: QSS + QPalette для всех окон (QFileDialog, списки, комбо — без
         светлого текста на светлом); лог перекрашивается при смене темы; цвета статусов под тему;
         EXE без uac_admin (права просит сама программа, --selftest в build_exe.bat не падает);
@@ -60,7 +64,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -510,17 +514,18 @@ def cursor_size_set(n: int) -> None:
     log.info(f"✓ Размер указателя: {n} ({32 + (n - 1) * 16} px)")
 
 
-def cursor_scan():
+def cursor_scan(bad_files=None):
+    """bad_files — имена подменённых файлов в C:\\Windows\\Cursors (None — ещё не проверено)."""
     scheme = reg_get("HKCU", CUR_KEY, "") or "(без схемы)"
     rows = []
-    sysdir = os.path.join(WINDIR, "cursors").lower()
+    sysdir = os.path.join(WINDIR, "cursors").lower() + "\\"
     for reg, title, std in CURSORS:
         v = reg_get("HKCU", CUR_KEY, reg) or ""
         full = os.path.expandvars(v)
         if not v:
             st = "ok"
-        elif full.lower().startswith(sysdir) and os.path.basename(full).lower().startswith("aero_"):
-            st = "warn"
+        elif full.lower().startswith(sysdir):  # файл самой Windows: норма, если не подменён
+            st = "warn" if bad_files is None or os.path.basename(full).lower() in bad_files else "ok"
         elif "\\microsoft\\windows\\cursors\\" in full.lower() and full.lower().endswith("_eoa.cur"):
             st = "ok"  # создаёт сама Windows (Параметры → Указатель мыши)
         else:
@@ -530,38 +535,72 @@ def cursor_scan():
     return scheme, rows, custom
 
 
-def cursor_files_tampered():
-    """Файлы aero_* в C:\\Windows\\Cursors, владелец которых не TrustedInstaller (подменены сборкой)."""
-    if not IS_WIN:
-        return []
-    code, out, _ = run_ps(
-        "Get-ChildItem \"$env:SystemRoot\\Cursors\\aero_*\" | %{ $o=((Get-Acl $_.FullName).Owner) -replace '^O:','';"
-        " if($o -match '^S-1-'){ try{ $o=(New-Object Security.Principal.SecurityIdentifier($o))"
-        ".Translate([Security.Principal.NTAccount]).Value }catch{} };"
-        " if($o -notmatch 'TrustedInstaller'){ $_.Name + ' (' + $o + ')' } }")
-    return [x.strip() for x in out.splitlines() if x.strip()]
-
-
-CURSOR_RESTORE_PS = r"""
+# общие куски PowerShell: поиск оригиналов в WinSxS, владелец, права как у оригинала
+_CUR_PS_LIB = r"""
 $dst = Join-Path $env:SystemRoot 'Cursors'
-$hit = Get-ChildItem (Join-Path $env:SystemRoot 'WinSxS') -Directory -ErrorAction SilentlyContinue |
-  ?{ Test-Path (Join-Path $_.FullName 'aero_arrow.cur') } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+function Find-Src { Get-ChildItem (Join-Path $env:SystemRoot 'WinSxS') -Directory -ErrorAction SilentlyContinue |
+  ?{ Test-Path (Join-Path $_.FullName 'aero_arrow.cur') } | Sort-Object LastWriteTime -Descending | Select-Object -First 1 }
+function Get-Owner($p){ $o = ((Get-Acl $p).Owner) -replace '^O:',''
+  if($o -match '^S-1-'){ try{ $o = (New-Object Security.Principal.SecurityIdentifier($o)).Translate([Security.Principal.NTAccount]).Value }catch{} }
+  $o }
+function Is-TI($o){ $o -match 'TrustedInstaller' -or $o -eq 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' }
+function Set-OrigAcl($t){
+  icacls "$t" /inheritance:r /grant:r 'NT SERVICE\TrustedInstaller:F' '*S-1-5-32-544:RX' '*S-1-5-18:RX' `
+    '*S-1-5-32-545:RX' '*S-1-15-2-1:RX' | Out-Null
+  icacls "$t" /setowner 'NT SERVICE\TrustedInstaller' | Out-Null
+  $LASTEXITCODE -eq 0 }
+"""
+
+CURSOR_CHECK_PS = _CUR_PS_LIB + r"""
+$suspect = @(Get-ChildItem $dst -File | ?{ $_.Extension -in '.cur','.ani' -and -not (Is-TI (Get-Owner $_.FullName)) })
+if(-not $suspect){ exit 0 }
+$hit = Find-Src
+foreach($f in $suspect){
+  $src = if($hit){ Join-Path $hit.FullName $f.Name }
+  if($src -and (Test-Path $src) -and (Get-FileHash $src).Hash -eq (Get-FileHash $f.FullName).Hash){ 'OWNER ' + $f.Name }
+  elseif(-not $src -or -not (Test-Path $src)){ 'NOREF ' + $f.Name + ' (' + (Get-Owner $f.FullName) + ')' }
+  else{ 'BAD ' + $f.Name + ' (' + (Get-Owner $f.FullName) + ')' }
+}
+"""
+
+
+def cursor_files_check():
+    """Сверка файлов C:\\Windows\\Cursors с оригиналами WinSxS (только тех, у кого владелец не TrustedInstaller).
+    → (подменены, только_владелец). Оригинальный файл с другим владельцем — НЕ подмена."""
+    if not IS_WIN:
+        return [], []
+    code, out, _ = run_ps(CURSOR_CHECK_PS, timeout=600)
+    lines = [x.strip() for x in out.splitlines() if x.strip()]
+    bad = [x[4:] for x in lines if x.startswith("BAD ")]
+    owner = [x[6:] for x in lines if x.startswith("OWNER ")]
+    noref = [x[6:] for x in lines if x.startswith("NOREF ")]
+    for x in noref:
+        log.debug(f"нет оригинала в WinSxS для сверки: {x}")
+    return bad, owner
+
+
+def bad_names(bad) -> set:
+    return {x.split(" (")[0].lower() for x in bad}
+
+
+CURSOR_RESTORE_PS = _CUR_PS_LIB + r"""
+$hit = Find-Src
 if(-not $hit){ 'NOSRC'; exit 2 }
 'SRC ' + $hit.FullName
 foreach($f in Get-ChildItem $hit.FullName -File | ?{ $_.Extension -in '.cur','.ani' }){
   $t = Join-Path $dst $f.Name
-  if((Test-Path $t) -and (Get-FileHash $t).Hash -eq (Get-FileHash $f.FullName).Hash){ 'SAME ' + $f.Name; continue }
+  if((Test-Path $t) -and (Get-FileHash $t).Hash -eq (Get-FileHash $f.FullName).Hash){
+    if(Is-TI (Get-Owner $t)){ 'SAME ' + $f.Name }
+    elseif(Set-OrigAcl $t){ 'ACL ' + $f.Name } else { 'OWNER ' + $f.Name }   # оригинал, но владелец не тот
+    continue
+  }
   try{
     if(Test-Path $t){
       takeown /f "$t" /a | Out-Null
       icacls "$t" /grant '*S-1-5-32-544:F' | Out-Null
     }
     Copy-Item $f.FullName $t -Force -ErrorAction Stop
-    # права как у оригинала: владелец TrustedInstaller, остальным — чтение
-    icacls "$t" /inheritance:r /grant:r 'NT SERVICE\TrustedInstaller:F' '*S-1-5-32-544:RX' '*S-1-5-18:RX' `
-      '*S-1-5-32-545:RX' '*S-1-15-2-1:RX' | Out-Null
-    icacls "$t" /setowner 'NT SERVICE\TrustedInstaller' | Out-Null
-    if($LASTEXITCODE){ 'OWNER ' + $f.Name }
+    if(-not (Set-OrigAcl $t)){ 'OWNER ' + $f.Name }
     'OK ' + $f.Name
   }catch{ 'FAIL ' + $f.Name + ' : ' + $_.Exception.Message }
 }
@@ -583,10 +622,12 @@ def cursor_restore_files():
     same = [x for x in lines if x.startswith("SAME ")]
     fail = [x[5:] for x in lines if x.startswith("FAIL ")]
     owner = [x[6:] for x in lines if x.startswith("OWNER ")]
+    acl = [x for x in lines if x.startswith("ACL ")]
     for x in lines:
         if x.startswith("SRC "):
             log.info(f"   источник: {x[4:]}")
-    log.info(f"✓ Восстановлено файлов: {len(ok)}, уже оригинальных: {len(same)}")
+    log.info(f"✓ Восстановлено файлов: {len(ok)}, уже оригинальных: {len(same) + len(acl)}"
+             + (f" (у {len(acl)} возвращён владелец TrustedInstaller)" if acl else ""))
     if owner:
         log.warning(f"⚠ Владелец TrustedInstaller не назначен ({len(owner)}): " + ", ".join(owner[:6]))
     for f in fail[:10]:
@@ -1376,6 +1417,7 @@ class App(QMainWindow):
         self.checks = build_checks()
         self.check_res: list = []
         self.busy_btns: list = []
+        self._cur_bad = None  # подменённые файлы курсоров (None — проверка ещё идёт)
         self._log_lines: deque = deque(maxlen=5000)
         self._size_timer = QTimer(self)
         self._size_timer.setSingleShot(True)
@@ -1618,6 +1660,25 @@ class App(QMainWindow):
     def _refresh_light(self):
         self.cursor_refresh()
         self.sound_refresh()
+        self._cur_check_bg()
+
+    def _cur_check_bg(self):
+        """Сверка файлов курсоров с WinSxS — в отдельном потоке, кнопки не блокирует."""
+        def body():
+            try:
+                bad, owner = cursor_files_check()
+            except Exception:
+                log.debug("проверка файлов курсоров упала", exc_info=True)
+                return
+            self._cur_bad = bad_names(bad)
+            if bad:
+                log.warning(f"⚠ Подменены файлы курсоров ({len(bad)}): " + ", ".join(bad[:6])
+                            + (" …" if len(bad) > 6 else "") + " — «🧩 Восстановить файлы»")
+            if owner:
+                log.info(f"   файлы курсоров оригинальные, но владелец не TrustedInstaller ({len(owner)}) — "
+                         "«🧩 Восстановить файлы» вернёт права")
+            ui(self.cursor_refresh)
+        threading.Thread(target=body, daemon=True).start()
 
     # ── 🖱 курсор ──
     def _page_cursor(self, pl):
@@ -1632,7 +1693,7 @@ class App(QMainWindow):
                           _btn("🔄 Обновить", "", "Перечитать реестр", self.cursor_refresh),
                           _btn("🗑 Удалить авторские схемы", "danger",
                                "Удалить пользовательские схемы из списка «Схема»", self.cursor_drop),
-                          _btn("🧩 Восстановить файлы", "", "Вернуть оригинальные aero_* из WinSxS в C:\\Windows\\Cursors",
+                          _btn("🧩 Восстановить файлы", "", "Вернуть оригинальные файлы из WinSxS в C:\\Windows\\Cursors (и владельца TrustedInstaller)",
                                self.cursor_files),
                           _btn("🖱 Свойства мыши", "", "main.cpl", lambda: shell_open("main.cpl"))))
         self.cur_size = Stepper(cursor_size_get(), 1, 15)
@@ -1643,12 +1704,12 @@ class App(QMainWindow):
                           _btn("⚙ Параметры указателя", "chip", "ms-settings:easeofaccess-mousepointer",
                                lambda: shell_open("ms-settings:easeofaccess-mousepointer"))))
         cl.addWidget(_lab("✓ (системный) — встроенный курсор Windows, подменить его сборка не может. "
-                          "⚠ — файл из C:\\Windows\\Cursors (сборка могла заменить сам файл). "
-                          "✗ — чужой файл. Вернуть оригинальные файлы — 🛠 DISM + SFC.", "hint"))
+                          "✓ файл из C:\\Windows\\Cursors — сверен с оригиналом в WinSxS. ⚠ — файл подменён "
+                          "(или ещё сверяется). ✗ — чужой файл. Вернуть оригиналы — «🧩 Восстановить файлы».", "hint"))
         pl.addWidget(c, 1)
 
     def cursor_refresh(self):
-        scheme, rows, custom = cursor_scan()
+        scheme, rows, custom = cursor_scan(self._cur_bad)
         self.cur_size.set_value(cursor_size_get())
         self.cur_scheme.setText(f"Схема: {scheme}" + (f"   ·   авторских схем: {len(custom)}" if custom else ""))
         t = self.cur_tbl
@@ -1660,7 +1721,8 @@ class App(QMainWindow):
         bad = sum(1 for x in rows if x[2] == "bad")
         warn = sum(1 for x in rows if x[2] == "warn")
         self._status("Курсор: " + (f"✗ чужих файлов {bad}" if bad else
-                                   f"⚠ файлы C:\\Windows\\Cursors: {warn}" if warn else "✓ стандартный"))
+                                   ("⏳ сверяю файлы с WinSxS…" if self._cur_bad is None else f"⚠ подменено файлов {warn}")
+                                   if warn else "✓ стандартный"))
 
     def _cur_size(self, n, set_widget=False):
         """Клики [−][+] копятся 400 мс, применяется последнее значение."""
@@ -1691,12 +1753,16 @@ class App(QMainWindow):
 
         def job():
             cursor_restore_files()
+            bad, _owner = cursor_files_check()
+            self._cur_bad = bad_names(bad)
+            log.info("✓ Все файлы курсоров оригинальные" if not bad else f"⚠ Остались подменённые: {', '.join(bad[:6])}")
             ui(self.cursor_refresh)
         self.worker.run("восстановление файлов курсоров", job)
 
     def cursor_reset(self):
         def job():
-            bad = cursor_files_tampered()
+            bad, _owner = cursor_files_check()
+            self._cur_bad = bad_names(bad)
             if bad:
                 log.warning(f"⚠ Сборка подменила файлы курсоров в C:\\Windows\\Cursors ({len(bad)}): "
                             + ", ".join(bad[:6]) + (" …" if len(bad) > 6 else ""))
