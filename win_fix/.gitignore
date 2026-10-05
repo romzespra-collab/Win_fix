@@ -1,0 +1,9 @@
+config.json
+*.log
+logs/
+__pycache__/
+build/
+dist/
+release/
+selftest.txt
+removed_startup/
