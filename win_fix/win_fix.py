@@ -1,9 +1,12 @@
 r"""
-win_fix.py  v1.7.2
+win_fix.py  v1.7.3
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.7.3: все таблицы: колонки раздвигаются мышкой (ширина по содержимому до 520 px, длинное — «…» в середине,
+        горизонтальная прокрутка); двойной клик / «🔍 Подробно» — окно со всей строкой целиком (выделить,
+        копировать). В 🗑 Программах двойной клик больше не запускает удаление — только «Подробно».
 v1.7.2: чистка реестра по реальному списку пользователя (121 → без ложных):
         убрана проверка CLSID→AppID (в LRC она фактически не работала; у COM из Магазина AppID в пакете);
         иконка «"путь,1"» в кавычках разбирается верно (Telegram); иконка по имени без папки не проверяется;
@@ -121,7 +124,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -2942,14 +2945,62 @@ def _table(headers, stretch_col=-1):
     t.verticalHeader().setVisible(False)
     t.verticalHeader().setDefaultSectionSize(26)
     h = t.horizontalHeader()
-    h.setSectionResizeMode(QHeaderView.ResizeToContents)
-    h.setSectionResizeMode(stretch_col if stretch_col >= 0 else len(headers) - 1, QHeaderView.Stretch)
+    h.setSectionResizeMode(QHeaderView.Interactive)  # колонки раздвигаются мышкой
+    h.setStretchLastSection(True)
+    h.setMinimumSectionSize(40)
+    t.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+    t.setTextElideMode(Qt.ElideMiddle)
+    tm = QTimer(t)  # после заполнения — ширина по содержимому (≤ 520 px), дальше пользователь двигает сам
+    tm.setSingleShot(True)
+    tm.timeout.connect(lambda: _autosize(t))
+    for sig in (t.model().rowsInserted, t.model().rowsRemoved, t.model().modelReset):
+        sig.connect(lambda *_: tm.start(30))
+    t.itemDoubleClicked.connect(lambda it: _row_details(t, it.row()))
+    t.setToolTip("Двойной клик — вся строка целиком · колонки раздвигаются мышкой · Ctrl+C — копировать")
     t.setContextMenuPolicy(Qt.CustomContextMenu)
     t.setWordWrap(False)
     sc = QShortcut(QKeySequence.Copy, t)  # Ctrl+C — выделенные строки (или всё, если ничего не выделено)
     sc.setContext(Qt.WidgetWithChildrenShortcut)
     sc.activated.connect(lambda: _copy(_table_text(t, sorted({i.row() for i in t.selectedIndexes()}) or None)))
     return t
+
+
+def _autosize(t: QTableWidget) -> None:
+    for c in range(t.columnCount() - 1):
+        t.resizeColumnToContents(c)
+        if t.columnWidth(c) > 520:
+            t.setColumnWidth(c, 520)
+
+
+def _row_details(t: QTableWidget, row: int) -> None:
+    """Окно со всей строкой таблицы: каждое поле целиком, можно выделить и скопировать."""
+    if row < 0:
+        return
+    from PySide6.QtWidgets import QDialog
+    parts = []
+    for c in range(t.columnCount()):
+        it = t.item(row, c)
+        txt = it.text() if it else ""
+        head = t.horizontalHeaderItem(c).text()
+        if it is not None and it.data(Qt.CheckStateRole) is not None:  # колонка-галочка
+            txt, head = ("☑ да" if it.checkState() == Qt.Checked else "☐ нет"), head or "Отмечено"
+        tip = it.toolTip() if it else ""
+        parts.append(f"{head or '—'}:\n  {txt}" + (f"\n  ({tip})" if tip and tip != txt and tip != it.text() else ""))
+    text = "\n\n".join(parts)
+    d = QDialog(t.window())
+    d.setWindowTitle(f"{APP_NAME} — подробно")
+    d.resize(760, 420)
+    lay = QVBoxLayout(d)
+    ed = QPlainTextEdit(text)
+    ed.setReadOnly(True)
+    ed.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+    ed.setContextMenuPolicy(Qt.CustomContextMenu)
+    ed.customContextMenuRequested.connect(lambda pos: _menu(d, [("📋 Копировать выделенное", ed.copy),
+                                                               ("📋 Копировать всё", lambda: _copy(text)),
+                                                               ("Выделить всё", ed.selectAll)]).exec(ed.mapToGlobal(pos)))
+    lay.addWidget(ed, 1)
+    lay.addLayout(_row(_btn("📋 Копировать всё", "primary", "", lambda: _copy(text)), _btn("Закрыть", "", "", d.accept)))
+    d.exec()
 
 
 def _cell(text, color=None, tip=""):
@@ -3943,7 +3994,8 @@ class App(QMainWindow):
 
     def _std_menu(self, t: QTableWidget, pos, acts):
         rows = self._sel_rows(t)
-        acts = acts + [None, ("📋 Копировать строку", lambda: _copy(_table_text(t, rows))),
+        acts = [("🔍 Подробно (вся строка)…", lambda: rows and _row_details(t, rows[0])), None] + acts + \
+            [None, ("📋 Копировать строку", lambda: _copy(_table_text(t, rows))),
                        ("📋 Копировать всё", lambda: _copy(_table_text(t)))]
         _menu(self, acts).exec(t.viewport().mapToGlobal(pos))
 
@@ -4323,7 +4375,6 @@ class App(QMainWindow):
         cl.addWidget(self.ap_filter)
         self.ap_tbl = _table(["Программа", "Версия", "Издатель", "МБ", "Дата", "Для"], 0)
         self.ap_tbl.customContextMenuRequested.connect(self._ap_menu)
-        self.ap_tbl.itemDoubleClicked.connect(lambda *_: self._ap_uninstall())
         cl.addWidget(self.ap_tbl, 1)
         b1 = self._scan_btn("🔄 Список", "Программы из реестра (как в «Программах и компонентах»)", self.apps_refresh)
         b2 = _btn("🗑 Удалить программу", "danger", "Деинсталлятор программы → поиск остатков", self._ap_uninstall)
