@@ -1,9 +1,14 @@
 r"""
-win_fix.py  v1.7.0
+win_fix.py  v1.7.1
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.7.1: ИСПРАВЛЕНО: ложные «нет файла» у 32-битных COM (Wow6432Node): 64-битный Python раскрывал %ProgramFiles%
+        как «Program Files», а не «(x86)» — теперь файл «отсутствует», только если его нет ни в одном толковании
+        (Program Files / (x86), System32 / SysWOW64); в строке COM — имя класса и пометка [32-бит].
+        Копирование: Ctrl+C в любой таблице (выделенные строки или всё), «📋 Копировать всё» и
+        «💾 Сохранить список…» на странице чистки, пункты в меню правого клика.
 v1.7.0: правила чистки и удаления остатков — по коду открытых проектов, а не «на глаз»:
         🧽 Чистка — как Little Registry Cleaner (github.com/little-apps, GPL): убрано выдуманное правило «пустой
         класс»; добавлено: класс без файла иконки, ActiveX/COM (нет InprocServer32/LocalServer32, нет AppID),
@@ -110,7 +115,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -169,7 +174,7 @@ ensure_packages()
 
 from PySide6.QtCore import QByteArray, QItemSelectionModel, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal  # noqa: E402
 from PySide6.QtGui import (QAction, QColor, QFont, QGuiApplication, QPainter,  # noqa: E402
-                           QPalette, QTextCharFormat, QTextCursor)
+                           QKeySequence, QPalette, QShortcut, QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView, QApplication,  # noqa: E402
                                QButtonGroup, QFileDialog, QFrame, QHBoxLayout,
                                QHeaderView, QLabel, QLayout, QLineEdit, QMainWindow, QMenu,
@@ -2305,8 +2310,28 @@ def _search_path(name: str, wow32: bool = False) -> bool:
     return any(os.path.isfile(os.path.join(d, name + e)) for d in dirs if d for e in exts)
 
 
+def _wow_variants(raw: str) -> list:
+    """32-битная запись: %ProgramFiles% = Program Files (x86), System32 = SysWOW64 — пробуем все толкования."""
+    out = [raw]
+    x86 = re.sub(r"(?i)%(ProgramFiles|CommonProgramFiles)%", r"%\1(x86)%", raw)
+    x86 = re.sub(r"(?i)\\Program Files\\", r"\\Program Files (x86)\\", x86)
+    for v in (x86, re.sub(r"(?i)\\system32\\", r"\\SysWOW64\\", raw),
+              re.sub(r"(?i)\\system32\\", r"\\SysWOW64\\", x86)):
+        if v not in out:
+            out.append(v)
+    return out
+
+
 def _path_state(p: str, icon: bool = False, wow32: bool = False, kind: str = "any") -> str:
-    """ok — есть; missing — нет; nodrive — диска нет (флешка/сеть отключены); skip — не путь / не проверяем."""
+    """ok — есть; missing — нет; nodrive — диска нет (флешка/сеть отключены); skip — не путь / не проверяем.
+    wow32 — запись из Wow6432Node: «нет» только если файла нет ни в одном 32/64-битном толковании пути."""
+    if wow32:
+        st = "missing"
+        for v in _wow_variants(str(p or "")):
+            st = _path_state(v, icon, False, kind)
+            if st in ("ok", "skip"):
+                return st
+        return st
     raw = str(p or "").strip()
     if raw.startswith(("@{", "{")) or "ms-resource:" in raw.lower() or "ms-appx" in raw.lower():
         return "skip"  # ресурсы приложений Магазина — не пути
@@ -2315,15 +2340,13 @@ def _path_state(p: str, icon: bool = False, wow32: bool = False, kind: str = "an
         p = p.rstrip("\\")  # «C:\\Folder\\» → «C:\\Folder»
     if not p or p in ("%1", "%l") or p.startswith(("\\\\?\\", "\\Device", "%")) or "://" in p:
         return "skip"
-    if wow32:  # 32-битная запись: System32 означает SysWOW64
-        p = re.sub(r"(?i)\\system32\\", r"\\SysWOW64\\", p)
-    elif _IS_WOW64:  # 32-битный Python видит SysWOW64 вместо System32
+    if _IS_WOW64:  # 32-битный Python видит SysWOW64 вместо System32
         p = re.sub(r"(?i)\\system32\\", r"\\Sysnative\\", p)
     drive, _r = os.path.splitdrive(p)
     if not drive and not os.path.isabs(p):
         if not os.path.splitext(p)[1] or os.sep in p or "/" in p:
             return "skip"  # не имя файла (или относительный путь) — не проверяем
-        return "ok" if _search_path(p, wow32) else "missing"
+        return "ok" if _search_path(p) or _search_path(p, True) else "missing"
     if drive:
         root = drive + "\\"
         dt = _drive_type(root) if IS_WIN else 3
@@ -2412,7 +2435,9 @@ def regclean_scan(cats=None, ignore=None) -> list:
                     if isinstance(v, str) and v.strip():
                         s = _path_state(exe_from_cmd(v) if srv == "LocalServer32" else v, wow32=w32, kind="file")
                         if _bad(s):
-                            add("com", f"{c} {srv}: {v}", root, rf"{k}\{srv}", "tree", state=s)
+                            cname = reg_get(root, k, "")
+                            add("com", f"{c}" + (f" «{cname}»" if isinstance(cname, str) and cname else "")
+                                + f" {srv}: {v}" + (" [32-бит]" if w32 else ""), root, rf"{k}\{srv}", "tree", state=s)
                 appid = reg_get(root, k, "AppID")
                 if isinstance(appid, str) and GUID_RE.match(appid) and not _key_exists_any(rf"AppID\{appid}"):
                     add("com", f"{c}: AppID {appid} нет", root, k, "val", name="AppID")
@@ -2914,6 +2939,9 @@ def _table(headers, stretch_col=-1):
     h.setSectionResizeMode(stretch_col if stretch_col >= 0 else len(headers) - 1, QHeaderView.Stretch)
     t.setContextMenuPolicy(Qt.CustomContextMenu)
     t.setWordWrap(False)
+    sc = QShortcut(QKeySequence.Copy, t)  # Ctrl+C — выделенные строки (или всё, если ничего не выделено)
+    sc.setContext(Qt.WidgetWithChildrenShortcut)
+    sc.activated.connect(lambda: _copy(_table_text(t, sorted({i.row() for i in t.selectedIndexes()}) or None)))
     return t
 
 
@@ -4477,7 +4505,10 @@ class App(QMainWindow):
         self.busy_btns.append(b2)
         cl.addLayout(_row(b1, b2, _btn("☑ Отметить всё", "", "", lambda: self._rc_check_all(True)),
                           _btn("☐ Снять всё", "", "", lambda: self._rc_check_all(False)),
-                          _btn("🙈 Исключения…", "", "Что никогда не показывать и не трогать", self._rc_ignore_dlg)))
+                          _btn("🙈 Исключения…", "", "Что никогда не показывать и не трогать", self._rc_ignore_dlg),
+                          _btn("📋 Копировать всё", "", "Весь список в буфер обмена (Ctrl+C — выделенные строки)",
+                               lambda: _copy(self._rc_text())),
+                          _btn("💾 Сохранить список…", "", "В текстовый файл — удобно прислать", self._rc_save)))
         cl.addWidget(_lab("Отмечены только надёжные находки. ⚠ — файл на диске, который сейчас не подключён "
                           "(флешка, сетевой диск): не отмечается — подключите диск или включите переключатель выше. "
                           "Копия .reg не нужна: всё удалённое возвращает ↩ Откат.", "hint"))
@@ -4508,6 +4539,23 @@ class App(QMainWindow):
             t.setItem(i, 3, _cell(it["key"]))
         t.blockSignals(False)
         self._rc_count()
+
+    def _rc_text(self, only_checked=False) -> str:
+        items = self._rc_checked() if only_checked else self.rc_items
+        lines = [f"{APP_NAME} v{VERSION} · чистка реестра · {time.strftime('%Y-%m-%d %H:%M')} · найдено {len(items)}", ""]
+        for it in items:
+            mark = "[x]" if it in self._rc_checked() else "[ ]"
+            lines.append(f"{mark} {it['title']}\t{it['data']}\t{it['key']}" + (f"\t({it['note']})" if it["note"] else ""))
+        return "\r\n".join(lines)
+
+    def _rc_save(self):
+        if not self.rc_items:
+            return log.warning("⚠ Сначала «🔎 Сканировать»")
+        fn, _ = QFileDialog.getSaveFileName(self, "Сохранить список", str(APP_ROOT / f"regclean_{time.strftime('%Y%m%d_%H%M')}.txt"),
+                                            "Текст (*.txt)")
+        if fn:
+            Path(fn).write_text(self._rc_text(), "utf-8-sig")
+            log.info(f"✓ Список сохранён: {fn}")
 
     def _rc_nodrive(self):
         self.cfg["rc_nodrive"] = self.rc_nodrive.isChecked()
@@ -4621,7 +4669,10 @@ class App(QMainWindow):
     def _rc_menu(self, pos):
         rows = self._sel_rows(self.rc_tbl)
         it = self.rc_tbl.item(rows[0], 0).data(Qt.UserRole) if rows else None
-        acts = [("☑ Отметить выбранные", lambda: self._rc_set_sel(True)),
+        acts = [("📋 Копировать выделенное (Ctrl+C)", lambda: _copy(_table_text(self.rc_tbl, rows))),
+                ("📋 Копировать весь список", lambda: _copy(self._rc_text())),
+                ("💾 Сохранить список…", self._rc_save), None,
+                ("☑ Отметить выбранные", lambda: self._rc_set_sel(True)),
                 ("☐ Снять с выбранных", lambda: self._rc_set_sel(False)),
                 ("🙈 Никогда не трогать (ключ)", lambda: self._rc_ignore_add(rows, "key")),
                 ("🙈 Никогда не трогать (путь/данные)", lambda: self._rc_ignore_add(rows, "data")), None,
