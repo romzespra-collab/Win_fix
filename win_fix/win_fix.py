@@ -1,9 +1,15 @@
 r"""
-win_fix.py  v1.6.0
+win_fix.py  v1.6.1
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.6.1: ИСПРАВЛЕНО: удаление ключей реестра целиком не работало в Windows (RegDeleteTreeW через ctypes падал
+        на 64-битном Python) — теперь рекурсивно через winreg; затрагивало чистку реестра (расширения, пустые
+        ключи), меню Проводника, политики браузеров, остатки программ, ассоциацию .exe.
+        Чистка: служебные ключи FileExts (DDECache, OpenWithList) больше не считаются расширениями;
+        расширение не «неиспользуемое», если его открывает живая программа («Открыть с помощью»).
+        Галочка в чекбоксах таблиц.
 v1.6.0: 🧽 Чистка реестра (как в CCleaner): неиспользуемые расширения, неверный/пустой класс файлов, ошибки путей
         приложений (Compatibility Assistant, Layers, App Paths), ошибки установки (Installer\Folders), пустые
         программные ключи, правила брандмауэра на удалённые программы, устаревшие ссылки MUI, автозагрузка без
@@ -85,7 +91,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -549,8 +555,18 @@ def reg_delete_tree(root, path) -> None:
     log.debug(f"REG DELTREE {root}\\{path}")
     if getattr(_JOURNAL, "ops", None) is not None and reg_key_exists(root, path):
         journal({"t": "tree", "root": root, "path": path, "dump": reg_dump(root, path)})
-    ctypes.windll.advapi32.RegDeleteTreeW(HK[root], path)
-    wr.DeleteKey(HK[root], path) if reg_key_exists(root, path) else None
+    # только winreg: RegDeleteTreeW через ctypes на 64-битном Python падал (корень HKEY не влезал в int)
+
+    def rm(p):
+        for sub in reg_subkeys(root, p):
+            rm(rf"{p}\{sub}")
+        try:
+            wr.DeleteKeyEx(HK[root], p, W64, 0)
+        except FileNotFoundError:
+            pass
+    rm(path)
+    if reg_key_exists(root, path):
+        raise RuntimeError("ключ не удалён (нет прав?)")
 
 
 HK_FULL = {"HKCU": "HKEY_CURRENT_USER", "HKLM": "HKEY_LOCAL_MACHINE", "HKCR": "HKEY_CLASSES_ROOT",
@@ -2085,6 +2101,23 @@ def _rc_item(cat, data, root, path, op, name=None, state="missing"):
                 note="диск не подключён (флешка/сеть) — не отмечено" if nodrive else "")
 
 
+def _ext_used(ext: str) -> bool:
+    """Расширение кому-то нужно: есть класс в HKCR, выбор по умолчанию или «Открыть с помощью» живой программой."""
+    if reg_key_exists("HKCR", ext):
+        return True
+    base = rf"{FILEEXTS}\{ext}"
+    uc = reg_get("HKCU", base + r"\UserChoice", "ProgId")
+    if uc and reg_key_exists("HKCR", uc):
+        return True
+    for n, _v, _t in reg_values("HKCU", base + r"\OpenWithProgids"):
+        if n and reg_key_exists("HKCR", n):
+            return True
+    for n, v, _t in reg_values("HKCU", base + r"\OpenWithList"):
+        if n.lower() != "mrulist" and isinstance(v, str) and v and reg_key_exists("HKCR", rf"Applications\{v}"):
+            return True
+    return False
+
+
 def regclean_scan(cats=None) -> list:
     cats = set(cats or dict(RC_CATS))
     out = []
@@ -2094,8 +2127,7 @@ def regclean_scan(cats=None) -> list:
 
     if "fileexts" in cats:
         for ext in reg_subkeys("HKCU", FILEEXTS):
-            uc = reg_get("HKCU", rf"{FILEEXTS}\{ext}\UserChoice", "ProgId")
-            if ext in (".", "") or (not reg_key_exists("HKCR", ext) and not (uc and reg_key_exists("HKCR", uc))):
+            if ext == "." or (ext.startswith(".") and not _ext_used(ext)):  # DDECache, OpenWithList — служебные
                 add("fileexts", ext, "HKCU", rf"{FILEEXTS}\{ext}", "tree")
     if "badclass" in cats:
         for k in reg_subkeys("HKCR", ""):
@@ -2256,6 +2288,20 @@ def _palette(p: dict) -> QPalette:
 ST_TEXT = {"ok": "✓ норма", "warn": "⚠ изменено", "bad": "✗ чужое"}
 
 
+def _check_svg() -> str:
+    """Файл-картинка галочки для QSS (QSS берёт картинки только из файлов)."""
+    import tempfile
+    f = Path(tempfile.gettempdir()) / "winfix_check.svg"
+    try:
+        if not f.exists():
+            f.write_text('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7" '
+                         'fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" '
+                         'stroke-linejoin="round"/></svg>', "utf-8")
+        return f.as_posix()
+    except OSError:
+        return ""
+
+
 def _qss(p: dict) -> str:
     return f"""
     * {{ font-family: "Segoe UI"; font-size: 10pt; color: {p['text']}; }}
@@ -2306,7 +2352,7 @@ def _qss(p: dict) -> str:
     QTableView::indicator {{ width: 15px; height: 15px; border: 1px solid {p['muted']}; border-radius: 4px;
                              background: {p['panel2']}; }}
     QTableView::indicator:checked {{ background: {p['accent']}; border-color: {p['accent']};
-        image: url(none); }}
+        image: url({_check_svg()}); }}
     QTableCornerButton::section {{ background: {p['panel2']}; border: none; }}
     QPlainTextEdit#log {{ background: {p['log_bg']}; color: {p['log_fg']}; border: 1px solid {p['line']};
                           border-radius: 7px; font-family: Consolas; font-size: 9pt; }}
