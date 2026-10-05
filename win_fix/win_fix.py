@@ -1,9 +1,12 @@
 r"""
-win_fix.py  v1.6.2
+win_fix.py  v1.6.3
 WinFix — ремонт Windows после «сборок»: курсор, звуки входа, автозагрузка
 (музыка при входе), проверка реестра, открытые порты, DISM/SFC.
 
 Журнал:
+v1.6.3: ИСПРАВЛЕНО: «неверный класс» помечал ProgID COM-объектов Windows (Search.Indexer.1, Scriptlet.*,
+        ComPlusDebug.CorDebug.1 …) — теперь они исключаются по HKCR\CLSID (64 и 32 бит); классы «только с
+        описанием» — ⚠ без галочки; переключатель «неподключённые диски» отмечает только строки с дисками.
 v1.6.2: чистка реестра: переключатель «⚠ Неподключённые диски — тоже мусор» (как CCleaner, запоминается);
         удаление ключа снимает запрет Deny (UserChoice у расширений) и пробует снова;
         «пустой класс» — ещё и классы только с описанием (без shell/CLSID/иконки), если на них не ссылается
@@ -95,7 +98,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 APP_NAME = "WinFix"
-VERSION = "1.6.2"
+VERSION = "1.6.3"
 IS_WIN = os.name == "nt"
 NOWIN = 0x08000000 if IS_WIN else 0
 FROZEN = getattr(sys, "frozen", False)
@@ -2110,8 +2113,20 @@ def _path_state(p: str) -> str:
 def _rc_item(cat, data, root, path, op, name=None, state="missing"):
     nodrive = state == "nodrive"
     return dict(cat=cat, title=RC_TITLE[cat], data=str(data), key=rf"{root}\{path}" + (f"\\{name}" if name else ""),
-                root=root, path=path, name=name, op=op, st="warn" if nodrive else "bad",
+                root=root, path=path, name=name, op=op, st="warn" if nodrive else "bad", nodrive=nodrive,
                 note="диск не подключён (флешка/сеть) — не отмечено" if nodrive else "")
+
+
+def _com_progids() -> set:
+    """ProgID и VersionIndependentProgID всех COM-классов (64 и 32 бит)."""
+    out = set()
+    for base in ("CLSID", r"WOW6432Node\CLSID"):
+        for c in reg_subkeys("HKCR", base):
+            for sub in ("ProgID", "VersionIndependentProgID"):
+                v = reg_get("HKCR", rf"{base}\{c}\{sub}", "")
+                if isinstance(v, str) and v:
+                    out.add(v.lower())
+    return out
 
 
 def _ext_used(ext: str) -> bool:
@@ -2153,11 +2168,18 @@ def regclean_scan(cats=None) -> list:
                     if not reg_key_exists("HKCR", prog):
                         add("badclass", f"{k} → {prog}", "HKCR", k, "defval")
                 used.update(n.lower() for n, _v, _t in reg_values("HKCR", rf"{k}\OpenWithProgids"))
+        com = _com_progids()  # ProgID COM-объектов (Search.Indexer.1, Scriptlet.* …) — не трогаем никогда
         for k in keys:
-            if "." in k and not k.startswith((".", "*", "{")) and k.lower() not in used \
-                    and not reg_subkeys("HKCR", k) \
-                    and {n.lower() for n, _v, _t in reg_values("HKCR", k)} <= {"", "friendlytypename", "editflags", "infotip"}:
-                add("badclass", k, "HKCR", k, "tree")
+            kl = k.lower()
+            if "." not in k or k.startswith((".", "*", "{")) or kl in used or kl in com or reg_subkeys("HKCR", k):
+                continue
+            names = {n.lower() for n, _v, _t in reg_values("HKCR", k)}
+            if not names:
+                add("badclass", k, "HKCR", k, "tree")  # совсем пустой ключ
+            elif names <= {"", "friendlytypename", "editflags", "infotip"}:
+                it = _rc_item("badclass", k, "HKCR", k, "tree")
+                it.update(st="warn", note="только описание, без команд — похоже на остаток, проверьте")
+                out.append(it)
     if "apppaths" in cats:
         for root in ("HKCU", "HKLM"):
             store = COMPAT_STORE if root == "HKCU" else None
@@ -4167,7 +4189,8 @@ class App(QMainWindow):
         for i, it in enumerate(self.rc_items):
             chk = _cell("", tip=it["note"] or "")
             chk.setFlags(chk.flags() | Qt.ItemIsUserCheckable)
-            chk.setCheckState(Qt.Checked if it["st"] == "bad" or self.rc_nodrive.isChecked() else Qt.Unchecked)
+            chk.setCheckState(Qt.Checked if it["st"] == "bad" or (it.get("nodrive") and self.rc_nodrive.isChecked())
+                              else Qt.Unchecked)
             chk.setData(Qt.UserRole, it)
             t.setItem(i, 0, chk)
             t.setItem(i, 1, _cell(("⚠ " if it["st"] == "warn" else "") + it["title"],
@@ -4182,7 +4205,7 @@ class App(QMainWindow):
         t = self.rc_tbl
         t.blockSignals(True)
         for r in range(t.rowCount()):
-            if t.item(r, 0).data(Qt.UserRole)["st"] == "warn":
+            if t.item(r, 0).data(Qt.UserRole).get("nodrive"):
                 t.item(r, 0).setCheckState(Qt.Checked if self.rc_nodrive.isChecked() else Qt.Unchecked)
         t.blockSignals(False)
         self._rc_count()
